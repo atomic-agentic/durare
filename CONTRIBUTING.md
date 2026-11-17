@@ -5,7 +5,7 @@ all welcome.
 
 ## Development setup
 
-You need Rust **1.88 or later** (the MSRV, enforced in CI).
+You need Rust **1.94 or later** (the MSRV, enforced in CI).
 
 ```bash
 git clone https://github.com/SamuelXing/durare

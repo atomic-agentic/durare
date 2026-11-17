@@ -241,7 +241,7 @@ documents the workloads and measurement methodology.
 
 ## Minimum supported Rust version
 
-`durare` builds on Rust **1.88** and later, enforced by a dedicated CI job.
+`durare` builds on Rust **1.94** and later (sqlx 0.9's floor), enforced by a dedicated CI job.
 Raising the MSRV is a semver-minor change (it will never happen in a patch
 release).
 

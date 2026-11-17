@@ -8,7 +8,8 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # `atomic` carries atomic's fork changes (see the README).
+    branches: [main, atomic]
   # Skip draft PRs until they are marked ready (matches the Go/Python SDK CIs).
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
@@ -62,14 +63,14 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
   msrv:
-    name: msrv (1.88)
+    name: msrv (1.94)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       # The declared minimum supported Rust version (Cargo.toml `rust-version`).
       # Driven by transitive deps (home, icu); this job fails if a dep bump
       # raises the floor, so the pin can't silently rot.
-      - uses: dtolnay/rust-toolchain@1.88
+      - uses: dtolnay/rust-toolchain@1.94
       - uses: Swatinem/rust-cache@v2
       # TEMPORARY — remove once tinyvec 1.13.0 is yanked or 1.13.1 ships.
       # See the note above the `jobs:` key.
@@ -112,6 +113,10 @@ jobs:
       # See the note above the `jobs:` key.
       - name: pin tinyvec (tinyvec#225)
         run: cargo update -p tinyvec --precise 1.12.0
+      # The Postgres tests return early when DATABASE_URL is unset; fail here
+      # instead, so a missing or unreachable database never passes as a skip.
+      - name: Postgres must be reachable
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atc 'SELECT 1'
       - name: test
         # --all-features so opt-in features (conductor) are exercised; the
         # no-default-features job guards that the crate still builds without them.

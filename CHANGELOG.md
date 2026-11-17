@@ -99,6 +99,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bundled SQLite with unlock-notify, as sqlx 0.8 did, and no longer enables
   extension loading. Dynamic SQL is marked audited for sqlx 0.9's `SqlSafeStr`
   check; only validated identifiers are interpolated, and values stay bound.
+- The minimum supported Rust version is 1.94, sqlx 0.9's.
 - Only the `sqlite` backend is enabled by default; `postgres` is opt-in, so a
   default build links no Postgres driver.
 
