@@ -48,6 +48,18 @@ pub struct SqliteProvider {
     identity: crate::provider::ProviderIdentity,
 }
 
+/// Whether a connect error is SQLite's SQLITE_BUSY or SQLITE_LOCKED, including
+/// their extended codes.
+fn is_busy(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Database(d) => d
+            .code()
+            .and_then(|c| c.parse::<i32>().ok())
+            .is_some_and(|c| matches!(c & 0xff, 5 | 6)),
+        _ => false,
+    }
+}
+
 impl SqliteProvider {
     async fn insert_status_on(
         &self,
@@ -132,11 +144,26 @@ impl SqliteProvider {
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5));
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(opts)
-            .await?;
-        Ok(Self::from_pool(pool))
+        // Opening a new file switches it to WAL journaling, which takes a
+        // brief exclusive lock that SQLite's busy handler does not wait for:
+        // two processes opening one new file can get SQLITE_BUSY straight
+        // back. Retry within the same 5s budget the busy timeout gives.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut delay = std::time::Duration::from_millis(10);
+        loop {
+            match SqlitePoolOptions::new()
+                .max_connections(5)
+                .connect_with(opts.clone())
+                .await
+            {
+                Ok(pool) => return Ok(Self::from_pool(pool)),
+                Err(e) if is_busy(&e) && std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_millis(200));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     /// Build a provider from an existing pool.

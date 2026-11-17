@@ -182,6 +182,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- `SqliteProvider::connect` no longer fails with "database is locked" when
+  several processes or pools open one new database file at once: switching
+  the file to WAL takes a brief exclusive lock that SQLite's busy handler does
+  not wait for, so the connect retries within the 5s busy budget.
+
 - Step timing matches the reference SDKs: a child workflow's checkpoint
   records when the child was started (on the built-in providers), a durable
   timer's `DBOS.sleep` row (`sleep`, and the `recv`/`get_event` deadlines)
