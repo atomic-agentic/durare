@@ -1,3 +1,16 @@
+> **This is atomic's fork of durare.** It ports durare to sqlx 0.9 so that it
+> links beside the sqlx and `libsqlite3-sys` versions OpenAI Codex pins, for use
+> in [atomic](https://github.com/atomic-agentic/atomic). The changes live on the
+> `atomic` branch; `main` mirrors upstream.
+>
+> | | |
+> | --- | --- |
+> | Upstream | <https://github.com/SamuelXing/durare> |
+> | Base revision | `0994da0d6425c575ad4192353399c0eb8085b68a` (upstream `main`, 2026-11-11, `v0.5.0-41-g0994da0`) |
+> | Licence | MIT OR Apache-2.0, unchanged from upstream |
+>
+> The port is kept small so it can rebase on upstream and be offered back.
+
 # durare
 
 [![Crates.io](https://img.shields.io/crates/v/durare.svg)](https://crates.io/crates/durare)
