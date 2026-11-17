@@ -127,17 +127,21 @@ impl<'c> Tx<'c> {
     }
 
     /// Run a statement (INSERT/UPDATE/DELETE/DDL); returns rows affected.
+    ///
+    /// `sql` is run as given, so it must not be built from untrusted input:
+    /// pass values through `params`, which are always bound. The same holds
+    /// for [`query_all`](Self::query_all) and [`query_opt`](Self::query_opt).
     pub async fn execute(&mut self, sql: &str, params: &[Param]) -> Result<u64> {
         match &mut self.inner {
             #[cfg(feature = "postgres")]
             TxInner::Postgres(conn) => {
                 let sql = to_pg_placeholders(sql);
-                let q = bind_pg(sqlx::query(&sql), params);
+                let q = bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), params);
                 Ok(q.execute(&mut **conn).await?.rows_affected())
             }
             #[cfg(feature = "sqlite")]
             TxInner::Sqlite(conn) => {
-                let q = bind_sqlite(sqlx::query(sql), params);
+                let q = bind_sqlite(sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())), params);
                 Ok(q.execute(&mut **conn).await?.rows_affected())
             }
         }
@@ -149,7 +153,7 @@ impl<'c> Tx<'c> {
             #[cfg(feature = "postgres")]
             TxInner::Postgres(conn) => {
                 let sql = to_pg_placeholders(sql);
-                let q = bind_pg(sqlx::query(&sql), params);
+                let q = bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), params);
                 let rows = q.fetch_all(&mut **conn).await?;
                 Ok(rows
                     .into_iter()
@@ -160,7 +164,7 @@ impl<'c> Tx<'c> {
             }
             #[cfg(feature = "sqlite")]
             TxInner::Sqlite(conn) => {
-                let q = bind_sqlite(sqlx::query(sql), params);
+                let q = bind_sqlite(sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())), params);
                 let rows = q.fetch_all(&mut **conn).await?;
                 Ok(rows
                     .into_iter()
@@ -178,14 +182,14 @@ impl<'c> Tx<'c> {
             #[cfg(feature = "postgres")]
             TxInner::Postgres(conn) => {
                 let sql = to_pg_placeholders(sql);
-                let q = bind_pg(sqlx::query(&sql), params);
+                let q = bind_pg(sqlx::query(sqlx::AssertSqlSafe(sql)), params);
                 Ok(q.fetch_optional(&mut **conn).await?.map(|r| Row {
                     inner: RowInner::Postgres(r),
                 }))
             }
             #[cfg(feature = "sqlite")]
             TxInner::Sqlite(conn) => {
-                let q = bind_sqlite(sqlx::query(sql), params);
+                let q = bind_sqlite(sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())), params);
                 Ok(q.fetch_optional(&mut **conn).await?.map(|r| Row {
                     inner: RowInner::Sqlite(r),
                 }))
@@ -462,7 +466,7 @@ impl TransactionOptions {
             Error::RecoveryRequired(_)
                 | Error::ObservationFailed(_)
                 | Error::OutputSerialization(_)
-        ) && !(matches!(err, Error::Db(_)) && err.is_tx_conflict())
+        ) && (!matches!(err, Error::Db(_)) || !err.is_tx_conflict())
             && !err.is_scope_violation()
             && attempt < self.max_retries
             && self.retry_if.as_ref().is_none_or(|p| p(err))
@@ -513,9 +517,9 @@ fn bind_pg<'q>(
 
 #[cfg(feature = "sqlite")]
 fn bind_sqlite<'q>(
-    mut q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    mut q: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     params: &'q [Param],
-) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
     for p in params {
         q = match p {
             Param::Null => q.bind(Option::<&str>::None),

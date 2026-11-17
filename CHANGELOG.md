@@ -90,6 +90,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Requires sqlx 0.9 instead of 0.8, so durare links beside other crates that
+  pin sqlx 0.9 and `libsqlite3-sys` 0.39 in one dependency graph. sqlx-core,
+  sqlx-sqlite and sqlx-postgres come from `transact-rs/sqlx` at
+  `10462fa4414c6c7f1ed1d39bb31678e3b726878c` through `[patch.crates-io]`,
+  until a sqlx release accepts `libsqlite3-sys` 0.39; a workspace that depends
+  on durare needs the same patch entries. The `sqlite` feature enables sqlx's
+  bundled SQLite with unlock-notify, as sqlx 0.8 did, and no longer enables
+  extension loading. Dynamic SQL is marked audited for sqlx 0.9's `SqlSafeStr`
+  check; only validated identifiers are interpolated, and values stay bound.
+
 - Migration 44 drops the per-row `workflow_events` NOTIFY trigger migration 1
   created, as the Go and Python SDKs do at that index. A Postgres provider now
   wakes its own `get_event` waiters the moment a `set_event` commits and pushes

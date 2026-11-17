@@ -171,6 +171,18 @@ compile_error!(
 // modules below; the guides re-export the relevant types with
 // `#[doc(no_inline)]` so every item's canonical documentation stays at the
 // crate root.
+/// Builds a dynamic SQL string and marks it as audited for sqlx 0.9's
+/// [`SqlSafeStr`](sqlx::SqlSafeStr) check.
+///
+/// Only identifiers durare controls are interpolated: table names derived
+/// from a schema name validated at construction, and constant column lists.
+/// Every value is a bound parameter, never part of the string.
+macro_rules! sql {
+    ($($arg:tt)*) => {
+        ::sqlx::AssertSqlSafe(::std::format!($($arg)*))
+    };
+}
+
 pub mod design;
 pub mod determinism;
 pub mod durability;

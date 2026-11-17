@@ -2495,7 +2495,7 @@ async fn pg_custom_schema_isolates_tenants() -> Result<()> {
     engine_b.shutdown(Duration::from_secs(1)).await?;
     // Clean up the tenant schemas so repeated runs don't accumulate.
     for schema in [&schema_a, &schema_b] {
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
             .execute(provider_a.pool())
             .await
             .map_err(Error::from)?;
@@ -3367,7 +3367,7 @@ async fn pg_system_queries_survive_search_path_change() -> Result<()> {
     assert!(names.contains(&"hijack") && names.contains(&"after"));
 
     engine.shutdown(Duration::from_secs(1)).await?;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(provider.pool())
         .await
         .map_err(Error::from)?;
@@ -3405,10 +3405,12 @@ async fn pg_transaction_checkpoint_race_is_a_conflict() -> Result<()> {
             "v1",
         ))
         .await?;
-    sqlx::query(&format!("CREATE TABLE {schema}.app_t (x TEXT NOT NULL)"))
-        .execute(provider.pool())
-        .await
-        .map_err(Error::from)?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {schema}.app_t (x TEXT NOT NULL)"
+    )))
+    .execute(provider.pool())
+    .await
+    .map_err(Error::from)?;
 
     let ser = provider.serializer();
     let planted = ser.encode(&json!("rival"))?;
@@ -3431,12 +3433,12 @@ async fn pg_transaction_checkpoint_race_is_a_conflict() -> Result<()> {
                 Box::pin(async move {
                     // The rival's checkpoint commits on another connection
                     // while this transaction is open.
-                    sqlx::query(&format!(
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
                         "INSERT INTO {schema}.operation_outputs
                              (workflow_uuid, function_id, function_name, output, serialization,
                               started_at_epoch_ms, completed_at_epoch_ms)
                          VALUES ($1, 0, 'racy', $2, $3, 2000, 2000)"
-                    ))
+                    )))
                     .bind(&id)
                     .bind(&planted)
                     .bind(&fmt)
@@ -3454,13 +3456,15 @@ async fn pg_transaction_checkpoint_race_is_a_conflict() -> Result<()> {
         matches!(res, Err(durare::Error::WorkflowConflict(ref w)) if *w == id),
         "a divergent rival write must be a conflict, got {res:?}"
     );
-    let committed: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {schema}.app_t"))
-        .fetch_one(provider.pool())
-        .await
-        .map_err(Error::from)?;
+    let committed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {schema}.app_t"
+    )))
+    .fetch_one(provider.pool())
+    .await
+    .map_err(Error::from)?;
     assert_eq!(committed, 0, "the losing body's writes must roll back");
 
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(provider.pool())
         .await
         .map_err(Error::from)?;
@@ -3528,7 +3532,7 @@ async fn pg_read_only_transaction_checkpoints_after_commit() -> Result<()> {
     );
 
     engine.shutdown(Duration::from_secs(1)).await?;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(provider.pool())
         .await
         .map_err(Error::from)?;
@@ -3592,7 +3596,7 @@ async fn pg_read_only_fast_path_checkpoints_after_commit() -> Result<()> {
     );
 
     engine.shutdown(Duration::from_secs(1)).await?;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(provider.pool())
         .await
         .map_err(Error::from)?;
@@ -3662,9 +3666,9 @@ async fn pg_from_pool_with_schema_pins_system_tables() -> Result<()> {
     assert_eq!(n, 42);
 
     // The row lives in the pinned schema, reachable by qualified name.
-    let found: i64 = sqlx::query_scalar(&format!(
+    let found: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM {schema}.workflow_status WHERE workflow_uuid = $1"
-    ))
+    )))
     .bind(&id)
     .fetch_one(provider.pool())
     .await
@@ -3676,7 +3680,7 @@ async fn pg_from_pool_with_schema_pins_system_tables() -> Result<()> {
     assert!(PostgresProvider::from_pool_with_schema(pool2, "user").is_err());
 
     engine.shutdown(Duration::from_secs(1)).await?;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(provider.pool())
         .await
         .map_err(Error::from)?;

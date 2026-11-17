@@ -117,11 +117,11 @@ async fn pg_schema_version_lives_in_the_shared_ledger() -> Result<()> {
         // sqlx's table records the version. It is adopted, and nothing is
         // re-applied (migration 1 would fail on the existing tables).
         // Only the columns the adoption reads.
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TABLE dbos.dbos_migrations;
              CREATE TABLE dbos._sqlx_migrations (version BIGINT PRIMARY KEY, success BOOLEAN NOT NULL);
              INSERT INTO dbos._sqlx_migrations VALUES ({PG_LATEST}, TRUE)"
-        ))
+        )))
         .execute(&pool)
         .await?;
         provider.ping().await?;
@@ -187,11 +187,11 @@ async fn sqlite_schema_version_lives_in_the_shared_ledger() -> Result<()> {
     assert_eq!(ledger_rows(&pool).await?, vec![125]);
 
     // Legacy sqlx ledger only: adopted, nothing re-applied.
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP TABLE dbos_migrations;
          CREATE TABLE _sqlx_migrations (version BIGINT PRIMARY KEY, success BOOLEAN NOT NULL);
          INSERT INTO _sqlx_migrations VALUES ({SQLITE_LATEST}, 1)"
-    ))
+    )))
     .execute(&pool)
     .await?;
     provider.init().await?;

@@ -83,7 +83,7 @@ pub async fn hermetic_pg_db(base_url: &str, prefix: &str) -> (PgPool, String, St
     let admin = PgPool::connect(base_url)
         .await
         .expect("connect to the base database");
-    sqlx::raw_sql(&format!("CREATE DATABASE {dbname}"))
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {dbname}")))
         .execute(&admin)
         .await
         .expect("create the hermetic database");
@@ -95,9 +95,11 @@ pub async fn hermetic_pg_db(base_url: &str, prefix: &str) -> (PgPool, String, St
 /// finished closing yet (Postgres 13+).
 #[cfg(feature = "postgres")]
 pub async fn drop_hermetic_pg_db(admin: &PgPool, dbname: &str) {
-    if let Err(e) = sqlx::raw_sql(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
-        .execute(admin)
-        .await
+    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {dbname} WITH (FORCE)"
+    )))
+    .execute(admin)
+    .await
     {
         eprintln!("hermetic db cleanup: leaving {dbname} behind: {e}");
     }

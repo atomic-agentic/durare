@@ -374,7 +374,7 @@ impl PostgresProvider {
         // per insert and never update it); it is stamped for cross-SDK schema
         // parity but plays no part in this SDK's arbitration — the returned
         // `created` flag is the equivalent "did this call create the row" test.
-        let created = sqlx::query(&format!(
+        let created = sqlx::query(sql!(
             "INSERT INTO {workflow_status}
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
@@ -420,7 +420,7 @@ impl PostgresProvider {
         .rows_affected()
             == 1;
 
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT {SELECT_COLS} FROM {workflow_status} WHERE workflow_uuid = $1",
             workflow_status = self.tables.workflow_status
         ))
@@ -597,12 +597,13 @@ impl PostgresProvider {
              WHERE application_version = '' AND status IN ($1, $2, $3)",
             workflow_status = self.tables.workflow_status
         );
-        let stranded: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(&sql)
-            .bind(STATUS_ENQUEUED)
-            .bind(STATUS_PENDING)
-            .bind(STATUS_DELAYED)
-            .fetch_one(&self.pool)
-            .await;
+        let stranded: std::result::Result<i64, sqlx::Error> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+                .bind(STATUS_ENQUEUED)
+                .bind(STATUS_PENDING)
+                .bind(STATUS_DELAYED)
+                .fetch_one(&self.pool)
+                .await;
         if let Ok(n) = stranded {
             if n > 0 {
                 tracing::warn!(
@@ -628,7 +629,7 @@ impl PostgresProvider {
     async fn run_migrations(&self) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
         if !self.schema.is_empty() {
-            sqlx::query(&format!("SET search_path TO {}", self.schema))
+            sqlx::query(sql!("SET search_path TO {}", self.schema))
                 .execute(&mut *conn)
                 .await?;
         }
@@ -649,7 +650,7 @@ impl PostgresProvider {
             .bind(crate::migrate::lock_key(&self.schema))
             .execute(&mut *tx)
             .await?;
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "CREATE TABLE IF NOT EXISTS {ledger} (version BIGINT NOT NULL PRIMARY KEY)",
             ledger = self.tables.dbos_migrations
         ))
@@ -692,7 +693,7 @@ impl PostgresProvider {
                     migration.version
                 )));
             }
-            (&mut *tx).execute(&*migration.sql).await?;
+            (&mut *tx).execute(migration.sql.clone()).await?;
             tracing::info!(
                 version = migration.version,
                 "applied system schema migration"
@@ -710,7 +711,7 @@ impl PostgresProvider {
     /// its row. Outside a transaction only, when the ledger may be missing: a
     /// failed statement would abort one.
     async fn ledger_version(&self, conn: &mut sqlx::PgConnection) -> Result<Option<i64>> {
-        let read = sqlx::query_scalar(&format!(
+        let read = sqlx::query_scalar(sql!(
             "SELECT version FROM {ledger} LIMIT 1",
             ledger = self.tables.dbos_migrations
         ))
@@ -734,7 +735,7 @@ impl PostgresProvider {
         if !exists {
             return Ok(None);
         }
-        Ok(sqlx::query_scalar(&format!(
+        Ok(sqlx::query_scalar(sql!(
             "SELECT max(version) FROM {legacy} WHERE success",
             legacy = self.tables.sqlx_migrations
         ))
@@ -758,7 +759,7 @@ impl PostgresProvider {
         conn: &mut sqlx::PgConnection,
         version: i64,
     ) -> Result<()> {
-        let updated = sqlx::query(&format!(
+        let updated = sqlx::query(sql!(
             "UPDATE {ledger} SET version = $1",
             ledger = self.tables.dbos_migrations
         ))
@@ -767,7 +768,7 @@ impl PostgresProvider {
         .await?
         .rows_affected();
         if updated == 0 {
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "INSERT INTO {ledger} (version) VALUES ($1)",
                 ledger = self.tables.dbos_migrations
             ))
@@ -795,7 +796,7 @@ impl PostgresProvider {
         error_col: Option<&str>,
         started_at_ms: i64,
     ) -> Result<()> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT function_name, output, error, started_at_epoch_ms
              FROM {operation_outputs}
              WHERE workflow_uuid = $1 AND function_id = $2",
@@ -832,7 +833,7 @@ impl PostgresProvider {
     /// transient outage keeps being retried until it clears or the workflow is
     /// actually cancelled.
     async fn conflict_retry_wait(&self, workflow_id: &str, attempt: u32) -> Result<()> {
-        let status: std::result::Result<Option<String>, _> = sqlx::query_scalar(&format!(
+        let status: std::result::Result<Option<String>, _> = sqlx::query_scalar(sql!(
             "SELECT status FROM {workflow_status} WHERE workflow_uuid = $1",
             workflow_status = self.tables.workflow_status
         ))
@@ -1194,7 +1195,7 @@ impl PostgresProvider {
         seq: i32,
         step_name: &str,
     ) -> Result<Option<Value>> {
-        let row: Option<RecordedColumns> = sqlx::query_as(&format!(
+        let row: Option<RecordedColumns> = sqlx::query_as(sql!(
             "SELECT function_name, output, error, serialization FROM {operation_outputs}
                  WHERE workflow_uuid = $1 AND function_id = $2",
             operation_outputs = self.tables.operation_outputs
@@ -1236,7 +1237,7 @@ impl PostgresProvider {
         output: &str,
         serialization: Option<&str>,
     ) -> Result<bool> {
-        let inserted = sqlx::query(&format!(
+        let inserted = sqlx::query(sql!(
             "INSERT INTO {operation_outputs}
                  (workflow_uuid, function_id, function_name, output, serialization,
                   completed_at_epoch_ms)
@@ -1312,7 +1313,7 @@ impl PostgresProvider {
         conn: &mut sqlx::PgConnection,
         workflow_id: &str,
     ) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "SELECT 1 FROM {workflow_status} WHERE workflow_uuid = $1 FOR NO KEY UPDATE",
             workflow_status = self.tables.workflow_status
         ))
@@ -1387,7 +1388,7 @@ impl PostgresProvider {
             None => (STREAM_CLOSED_SENTINEL.to_string(), None),
         };
 
-        let closed: Option<i32> = sqlx::query_scalar(&format!(
+        let closed: Option<i32> = sqlx::query_scalar(sql!(
             "SELECT 1 FROM {streams} WHERE workflow_uuid = $1 AND key = $2 AND value = $3 LIMIT 1",
             streams = self.tables.streams
         ))
@@ -1402,7 +1403,7 @@ impl PostgresProvider {
             )));
         }
 
-        sqlx::query(&format!("INSERT INTO {streams} (workflow_uuid, key, value, \"offset\", function_id, serialization)
+        sqlx::query(sql!("INSERT INTO {streams} (workflow_uuid, key, value, \"offset\", function_id, serialization)
              SELECT $1, $2, $3, COALESCE(
                  (SELECT MAX(\"offset\") FROM {streams} WHERE workflow_uuid = $1 AND key = $2), -1
              ) + 1, $4, $5", streams = self.tables.streams),
@@ -1428,7 +1429,7 @@ impl PostgresProvider {
         key: &str,
         value: Value,
     ) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO {workflow_events} (workflow_uuid, key, value, serialization)
              VALUES ($1, $2, $3, $4)
              ON CONFLICT (workflow_uuid, key)
@@ -1456,7 +1457,7 @@ impl PostgresProvider {
         let value = attributes
             .filter(|m| !m.is_empty())
             .map(|m| Value::Object(m.clone()));
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE {workflow_status} SET attributes = $2, updated_at = $3
              WHERE workflow_uuid = $1",
             workflow_status = self.tables.workflow_status
@@ -1493,7 +1494,7 @@ impl StateProvider for PostgresProvider {
         // `from_pool` leaves `schema` empty and skips this — the caller's pool
         // decides where names resolve.
         if !self.schema.is_empty() {
-            if let Err(e) = sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {}", self.schema))
+            if let Err(e) = sqlx::query(sql!("CREATE SCHEMA IF NOT EXISTS {}", self.schema))
                 .execute(&self.pool)
                 .await
             {
@@ -1563,7 +1564,7 @@ impl StateProvider for PostgresProvider {
         queue_name: &str,
         dedup_id: &str,
     ) -> Result<Option<String>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT workflow_uuid FROM {workflow_status} \
              WHERE queue_name = $1 AND deduplication_id = $2 LIMIT 1",
             workflow_status = self.tables.workflow_status
@@ -1576,7 +1577,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT {SELECT_COLS} FROM {workflow_status} WHERE workflow_uuid = $1",
             workflow_status = self.tables.workflow_status
         ))
@@ -1614,7 +1615,7 @@ impl StateProvider for PostgresProvider {
         };
         // Reaching a terminal state frees the queue-scoped deduplication slot so
         // the same deduplication id can be enqueued again.
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE {workflow_status}
              SET status = $2,
                  output = COALESCE($3, output),
@@ -1638,7 +1639,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn get_step_result(&self, workflow_id: &str, seq: i32) -> Result<Option<RecordedStep>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT function_name, output, error, serialization FROM {operation_outputs}
              WHERE workflow_uuid = $1 AND function_id = $2",
             operation_outputs = self.tables.operation_outputs
@@ -1714,7 +1715,7 @@ impl StateProvider for PostgresProvider {
         // already matches.
         let won = match executor_id {
             Some(executor) => {
-                sqlx::query_scalar::<_, bool>(&format!(
+                sqlx::query_scalar::<_, bool>(sql!(
                     "WITH ins AS (
                      INSERT INTO {operation_outputs}
                          (workflow_uuid, function_id, function_name, output, error, serialization,
@@ -1746,7 +1747,7 @@ impl StateProvider for PostgresProvider {
                 .await?
             }
             None => {
-                sqlx::query(&format!(
+                sqlx::query(sql!(
                     "INSERT INTO {operation_outputs}
                          (workflow_uuid, function_id, function_name, output, error, serialization,
                           started_at_epoch_ms, completed_at_epoch_ms)
@@ -1784,7 +1785,7 @@ impl StateProvider for PostgresProvider {
         // Identical content and start instant means a replay or a retry of
         // this same logical write — adopt it. Anything else is a live rival
         // execution (or a non-deterministic function, when the name differs).
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT function_name, output, error, serialization, started_at_epoch_ms
              FROM {operation_outputs}
              WHERE workflow_uuid = $1 AND function_id = $2",
@@ -1831,7 +1832,7 @@ impl StateProvider for PostgresProvider {
         // loop, sleeping through its whole backoff, before returning it). The
         // `ON CONFLICT DO NOTHING` inserts below guard the write side; there is a
         // single writer per (workflow_id, seq).
-        if let Some(r) = sqlx::query(&format!(
+        if let Some(r) = sqlx::query(sql!(
             "SELECT function_name, output, error, serialization FROM {operation_outputs}
              WHERE workflow_uuid = $1 AND function_id = $2",
             operation_outputs = self.tables.operation_outputs
@@ -1888,7 +1889,7 @@ impl StateProvider for PostgresProvider {
                         if opts.read_only {
                             stmt.push_str(" READ ONLY");
                         }
-                        sqlx::query(&stmt).execute(&mut *tx).await?;
+                        sqlx::query(sqlx::AssertSqlSafe(stmt)).execute(&mut *tx).await?;
                     }
                     // Run the user's body against this transaction. (Replay is
                     // handled up front, before the retry loops.)
@@ -1923,7 +1924,7 @@ impl StateProvider for PostgresProvider {
                         // the body's writes and the checkpoint commit atomically.
                         Ok(value) => {
                             let encoded = self.serializer.encode(&value)?;
-                            let won = sqlx::query(&format!("INSERT INTO {operation_outputs}
+                            let won = sqlx::query(sql!("INSERT INTO {operation_outputs}
                                      (workflow_uuid, function_id, function_name, output, serialization,
                                       started_at_epoch_ms, completed_at_epoch_ms)
                                  VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -2023,7 +2024,7 @@ impl StateProvider for PostgresProvider {
                 continue;
             }
             let encoded_err = serialize::encode_error(&self.serializer, &body_err)?;
-            let won = sqlx::query(&format!(
+            let won = sqlx::query(sql!(
                 "INSERT INTO {operation_outputs}
                      (workflow_uuid, function_id, function_name, error, serialization,
                       started_at_epoch_ms, completed_at_epoch_ms)
@@ -2097,7 +2098,7 @@ impl StateProvider for PostgresProvider {
                    AND status NOT IN ($2, $3) AND started_at_epoch_ms > $4{part_clause}",
                 workflow_status = self.tables.workflow_status
             );
-            let mut q = sqlx::query_scalar(&sql)
+            let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .bind(&req.queue_name)
                 .bind(STATUS_ENQUEUED)
                 .bind(STATUS_DELAYED)
@@ -2119,7 +2120,7 @@ impl StateProvider for PostgresProvider {
                 "SELECT COUNT(*) FROM {workflow_status} WHERE queue_name = $1 AND status = $2{part_clause}",
                 workflow_status = self.tables.workflow_status
             );
-            let mut q = sqlx::query_scalar(&sql)
+            let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .bind(&req.queue_name)
                 .bind(STATUS_PENDING);
             if let Some(p) = part {
@@ -2152,7 +2153,7 @@ impl StateProvider for PostgresProvider {
         // running the LATEST registered application version — otherwise a
         // stale-version executor could claim work whose handlers it no longer
         // has. No registered versions ⇒ treat this executor as latest.
-        let is_latest = sqlx::query_scalar::<_, String>(&format!(
+        let is_latest = sqlx::query_scalar::<_, String>(sql!(
             "SELECT version_name FROM {application_versions}
              ORDER BY version_timestamp DESC LIMIT 1",
             application_versions = self.tables.application_versions
@@ -2176,7 +2177,7 @@ impl StateProvider for PostgresProvider {
              {lock} LIMIT {limit_ph}",
             workflow_status = self.tables.workflow_status
         );
-        let mut q = sqlx::query_scalar(&sql)
+        let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(&req.queue_name)
             .bind(STATUS_ENQUEUED)
             .bind(&req.app_version);
@@ -2189,7 +2190,7 @@ impl StateProvider for PostgresProvider {
             return Ok(Vec::new());
         }
 
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sql!(
             "UPDATE {workflow_status}
              SET status = $1, executor_id = $2, application_version = $3,
                  started_at_epoch_ms = $4, rate_limited = $5, updated_at = $4,
@@ -2222,7 +2223,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn transition_delayed_workflows(&self, now_ms: i64) -> Result<u64> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE {workflow_status}
              SET status = $1, delay_until_epoch_ms = NULL, updated_at = $2,
                  deduplication_id = CASE WHEN is_debounced THEN NULL ELSE deduplication_id END
@@ -2238,7 +2239,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn queue_partitions(&self, queue_name: &str) -> Result<Vec<String>> {
-        let keys: Vec<String> = sqlx::query_scalar(&format!(
+        let keys: Vec<String> = sqlx::query_scalar(sql!(
             "SELECT DISTINCT queue_partition_key FROM {workflow_status}
              WHERE queue_name = $1 AND status = $2 AND queue_partition_key IS NOT NULL",
             workflow_status = self.tables.workflow_status
@@ -2265,7 +2266,7 @@ impl StateProvider for PostgresProvider {
         };
         // The FK on destination_uuid rejects sends to nonexistent workflows; a
         // duplicate keyed message_uuid is silently ignored.
-        sqlx::query(&format!("INSERT INTO {notifications}
+        sqlx::query(sql!("INSERT INTO {notifications}
                  (message_uuid, destination_uuid, topic, message, serialization, created_at_epoch_ms)
              VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (message_uuid) DO NOTHING", notifications = self.tables.notifications),
@@ -2326,7 +2327,7 @@ impl StateProvider for PostgresProvider {
         // the same oldest message and commits first, this UPDATE re-evaluates
         // against the committed row and matches nothing, instead of handing
         // the same message out twice.
-        let claimed: Option<(String, Option<String>)> = sqlx::query_as(&format!(
+        let claimed: Option<(String, Option<String>)> = sqlx::query_as(sql!(
             "WITH oldest_entry AS (
                  SELECT message_uuid FROM {notifications}
                  WHERE destination_uuid = $1 AND topic = $2 AND consumed = FALSE
@@ -2408,7 +2409,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn get_event_value(&self, workflow_id: &str, key: &str) -> Result<Option<Value>> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(&format!(
+        let row: Option<(String, Option<String>)> = sqlx::query_as(sql!(
             "SELECT value, serialization FROM {workflow_events}
              WHERE workflow_uuid = $1 AND key = $2",
             workflow_events = self.tables.workflow_events
@@ -2564,7 +2565,7 @@ impl StateProvider for PostgresProvider {
 
     async fn cancel_workflow(&self, id: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE {workflow_status}
              SET status = $2, completed_at = $3, started_at_epoch_ms = NULL,
                  queue_name = NULL, deduplication_id = NULL, updated_at = $3
@@ -2583,7 +2584,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn resume_workflow(&self, id: &str) -> Result<bool> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE {workflow_status}
              SET status = $2, recovery_attempts = 0, workflow_deadline_epoch_ms = NULL,
                  deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL,
@@ -2602,7 +2603,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn enqueue_existing(&self, id: &str, queue: &str) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE {workflow_status}
              SET status = $2, queue_name = $3, executor_id = '',
                  started_at_epoch_ms = NULL, updated_at = $4
@@ -2650,7 +2651,7 @@ impl StateProvider for PostgresProvider {
         } else {
             "workflow_uuid = ANY($1)"
         };
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "{targets}UPDATE {workflow_status}
              SET status = $2, completed_at = $3, started_at_epoch_ms = NULL,
                  queue_name = NULL, deduplication_id = NULL, updated_at = $3
@@ -2672,7 +2673,7 @@ impl StateProvider for PostgresProvider {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let resumed: Vec<String> = sqlx::query_scalar(&format!(
+        let resumed: Vec<String> = sqlx::query_scalar(sql!(
             "UPDATE {workflow_status}
              SET status = $2, recovery_attempts = 0, workflow_deadline_epoch_ms = NULL,
                  deduplication_id = NULL, started_at_epoch_ms = NULL, completed_at = NULL,
@@ -2697,7 +2698,7 @@ impl StateProvider for PostgresProvider {
         }
         // ON DELETE CASCADE removes each workflow's step / event / stream rows.
         if delete_children {
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "WITH RECURSIVE targets AS (
                      SELECT workflow_uuid FROM {workflow_status} WHERE workflow_uuid = ANY($1)
                      UNION
@@ -2712,7 +2713,7 @@ impl StateProvider for PostgresProvider {
             .execute(&self.pool)
             .await?;
         } else {
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "DELETE FROM {workflow_status} WHERE workflow_uuid = ANY($1)",
                 workflow_status = self.tables.workflow_status
             ))
@@ -2744,7 +2745,7 @@ impl StateProvider for PostgresProvider {
         // `completed_at` and a live status must never be collected.
         let mut total = 0u64;
         loop {
-            let res = sqlx::query(&format!(
+            let res = sqlx::query(sql!(
                 "DELETE FROM {workflow_status}
                  WHERE workflow_uuid IN (
                      SELECT workflow_uuid FROM {workflow_status}
@@ -2771,7 +2772,7 @@ impl StateProvider for PostgresProvider {
         // this is an index-only skip rather than a scan of the whole table. It
         // is also load-bearing on Postgres, which sorts NULLs *first* under
         // `DESC` and would otherwise count them against the offset.
-        Ok(sqlx::query_scalar(&format!(
+        Ok(sqlx::query_scalar(sql!(
             "SELECT completed_at FROM {workflow_status}
              WHERE completed_at IS NOT NULL
              ORDER BY completed_at DESC
@@ -2792,7 +2793,7 @@ impl StateProvider for PostgresProvider {
         // statement reads the same on both dialects. One statement, no
         // transaction: a miss is re-read by the holder lookup, and the caller
         // bounces again on anything that moved in between.
-        let bounced: Option<String> = sqlx::query_scalar(&format!(
+        let bounced: Option<String> = sqlx::query_scalar(sql!(
             "UPDATE {workflow_status}
              SET delay_until_epoch_ms = CASE
                    WHEN debounce_deadline_epoch_ms IS NOT NULL AND debounce_deadline_epoch_ms < $1
@@ -2821,7 +2822,7 @@ impl StateProvider for PostgresProvider {
             return Ok(DebounceOutcome::Bounced(id));
         }
         // The partial unique index admits at most one holder.
-        let holder = sqlx::query_as(&format!(
+        let holder = sqlx::query_as(sql!(
             "SELECT name, is_debounced, class_name, config_name FROM {workflow_status}
              WHERE queue_name = $1 AND deduplication_id = $2",
             workflow_status = self.tables.workflow_status
@@ -2834,7 +2835,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn set_workflow_delay(&self, id: &str, delay_until_ms: i64) -> Result<bool> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE {workflow_status} SET delay_until_epoch_ms = $2, updated_at = $3
              WHERE workflow_uuid = $1 AND status = $4",
             workflow_status = self.tables.workflow_status
@@ -2893,7 +2894,7 @@ impl StateProvider for PostgresProvider {
         let mut tx = self.pool.begin().await?;
         let now = Utc::now().timestamp_millis();
 
-        let inserted = sqlx::query(&format!(
+        let inserted = sqlx::query(sql!(
             "INSERT INTO {workflow_status}
                  (workflow_uuid, status, name, inputs, serialization, executor_id,
                   application_version, application_id, forked_from, recovery_attempts,
@@ -2923,7 +2924,7 @@ impl StateProvider for PostgresProvider {
             return Err(crate::error::Error::nonexistent_workflow(original_id));
         }
 
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE {workflow_status} SET was_forked_from = TRUE WHERE workflow_uuid = $1",
             workflow_status = self.tables.workflow_status
         ))
@@ -2932,7 +2933,7 @@ impl StateProvider for PostgresProvider {
         .await?;
 
         if start_step > 0 {
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "INSERT INTO {operation_outputs}
                      (workflow_uuid, function_id, function_name, output, error,
                       child_workflow_id, serialization)
@@ -2988,7 +2989,7 @@ impl StateProvider for PostgresProvider {
             "UPDATE {workflow_status} SET {set} {cas}",
             workflow_status = self.tables.workflow_status
         );
-        let mut q = sqlx::query(&sql)
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(req.workflow_id)
             .bind(req.expected_executor)
             .bind(req.expected_attempts)
@@ -3017,7 +3018,7 @@ impl StateProvider for PostgresProvider {
         return_existing: bool,
     ) -> Result<Option<crate::provider::ChildInsert>> {
         let mut tx = self.pool.begin().await?;
-        let parent = sqlx::query(&format!(
+        let parent = sqlx::query(sql!(
             "SELECT status FROM {workflow_status} WHERE workflow_uuid = $1 FOR UPDATE",
             workflow_status = self.tables.workflow_status
         ))
@@ -3025,7 +3026,7 @@ impl StateProvider for PostgresProvider {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| Error::nonexistent_workflow(parent_id))?;
-        if let Some(step) = sqlx::query(&format!(
+        if let Some(step) = sqlx::query(sql!(
             "SELECT function_name, child_workflow_id FROM {operation_outputs}
              WHERE workflow_uuid = $1 AND function_id = $2",
             operation_outputs = self.tables.operation_outputs,
@@ -3057,7 +3058,7 @@ impl StateProvider for PostgresProvider {
             // An INSERT conflict can disappear before this read on Postgres.
             // Retry inside this transaction; no decision is exposed until the
             // parent checkpoint commits alongside it.
-            if let Some(row) = sqlx::query(&format!(
+            if let Some(row) = sqlx::query(sql!(
                 "SELECT {SELECT_COLS} FROM {workflow_status}
                  WHERE queue_name = $1 AND deduplication_id = $2 FOR UPDATE",
                 workflow_status = self.tables.workflow_status,
@@ -3077,7 +3078,7 @@ impl StateProvider for PostgresProvider {
             tokio::task::yield_now().await;
         };
         crate::provider::check_child_target(&canonical, &child)?;
-        let recorded = sqlx::query(&format!(
+        let recorded = sqlx::query(sql!(
             "INSERT INTO {operation_outputs}
                  (workflow_uuid, function_id, function_name, child_workflow_id, started_at_epoch_ms)
              VALUES ($1, $2, $3, $4, $5) ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
@@ -3108,7 +3109,7 @@ impl StateProvider for PostgresProvider {
         name: &str,
         child_id: &str,
     ) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO {operation_outputs}
                  (workflow_uuid, function_id, function_name, child_workflow_id)
              VALUES ($1, $2, $3, $4)
@@ -3129,7 +3130,7 @@ impl StateProvider for PostgresProvider {
         parent_id: &str,
         seq: i32,
     ) -> Result<Option<(String, String)>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT child_workflow_id, function_name FROM {operation_outputs}
              WHERE workflow_uuid = $1 AND function_id = $2",
             operation_outputs = self.tables.operation_outputs
@@ -3154,7 +3155,7 @@ impl StateProvider for PostgresProvider {
         workflow_id: &str,
         options: StepListOptions,
     ) -> Result<Vec<StepInfo>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sql!(
             "SELECT function_id, function_name, {output}, error, child_workflow_id,
                     started_at_epoch_ms, completed_at_epoch_ms, serialization
              FROM {operation_outputs}
@@ -3178,7 +3179,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn get_step_name(&self, workflow_id: &str, seq: i32) -> Result<Option<String>> {
-        let name: Option<String> = sqlx::query_scalar(&format!(
+        let name: Option<String> = sqlx::query_scalar(sql!(
             "SELECT function_name FROM {operation_outputs}
              WHERE workflow_uuid = $1 AND function_id = $2",
             operation_outputs = self.tables.operation_outputs
@@ -3191,7 +3192,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn record_patch(&self, workflow_id: &str, seq: i32, name: &str) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO {operation_outputs} (workflow_uuid, function_id, function_name)
              VALUES ($1, $2, $3)
              ON CONFLICT (workflow_uuid, function_id) DO NOTHING",
@@ -3247,7 +3248,7 @@ impl StateProvider for PostgresProvider {
         key: &str,
         from_offset: i32,
     ) -> Result<(Vec<Value>, bool)> {
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(sql!(
             "SELECT value, serialization FROM {streams}
              WHERE workflow_uuid = $1 AND key = $2 AND \"offset\" >= $3
              ORDER BY \"offset\" ASC",
@@ -3272,7 +3273,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn list_workflow_events(&self, workflow_id: &str) -> Result<Vec<(String, Value)>> {
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(sql!(
             "SELECT key, value, serialization FROM {workflow_events}
              WHERE workflow_uuid = $1 ORDER BY key ASC",
             workflow_events = self.tables.workflow_events
@@ -3294,7 +3295,7 @@ impl StateProvider for PostgresProvider {
         &self,
         workflow_id: &str,
     ) -> Result<Vec<NotificationInfo>> {
-        let rows: Vec<(String, String, Option<String>, i64, bool)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String, Option<String>, i64, bool)> = sqlx::query_as(sql!(
             "SELECT topic, message, serialization, created_at_epoch_ms, consumed
              FROM {notifications} WHERE destination_uuid = $1
              ORDER BY created_at_epoch_ms ASC",
@@ -3316,7 +3317,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn list_workflow_streams(&self, workflow_id: &str) -> Result<Vec<(String, Vec<Value>)>> {
-        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(sql!(
             "SELECT key, value, serialization FROM {streams}
              WHERE workflow_uuid = $1 ORDER BY key ASC, \"offset\" ASC",
             streams = self.tables.streams
@@ -3328,7 +3329,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn create_schedule(&self, schedule: &WorkflowSchedule) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO {workflow_schedules} (
                  schedule_id, schedule_name, workflow_name, schedule, status, context,
                  last_fired_at, automatic_backfill, cron_timezone, queue_name
@@ -3382,14 +3383,14 @@ impl StateProvider for PostgresProvider {
     async fn apply_schedules(&self, schedules: &[WorkflowSchedule]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for s in schedules {
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "DELETE FROM {workflow_schedules} WHERE schedule_name = $1",
                 workflow_schedules = self.tables.workflow_schedules
             ))
             .bind(&s.schedule_name)
             .execute(&mut *tx)
             .await?;
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "INSERT INTO {workflow_schedules} (
                      schedule_id, schedule_name, workflow_name, schedule, status, context,
                      last_fired_at, automatic_backfill, cron_timezone, queue_name
@@ -3457,7 +3458,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn set_schedule_status(&self, name: &str, status: ScheduleStatus) -> Result<bool> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE {workflow_schedules} SET status = $1 WHERE schedule_name = $2",
             workflow_schedules = self.tables.workflow_schedules
         ))
@@ -3470,7 +3471,7 @@ impl StateProvider for PostgresProvider {
 
     async fn set_schedule_last_fired(&self, name: &str, at_ms: i64) -> Result<()> {
         let at = DateTime::from_timestamp_millis(at_ms).map(|t| t.to_rfc3339());
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "UPDATE {workflow_schedules} SET last_fired_at = $1 WHERE schedule_name = $2",
             workflow_schedules = self.tables.workflow_schedules
         ))
@@ -3482,7 +3483,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn delete_schedule(&self, name: &str) -> Result<bool> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "DELETE FROM {workflow_schedules} WHERE schedule_name = $1",
             workflow_schedules = self.tables.workflow_schedules
         ))
@@ -3494,7 +3495,7 @@ impl StateProvider for PostgresProvider {
 
     async fn create_application_version(&self, version_name: &str) -> Result<()> {
         let now = Utc::now().timestamp_millis();
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO {application_versions} \
              (version_id, version_name, version_timestamp, created_at) \
              VALUES ($1, $2, $3, $4) ON CONFLICT (version_name) DO NOTHING",
@@ -3510,7 +3511,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn list_application_versions(&self) -> Result<Vec<VersionInfo>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sql!(
             "SELECT version_id, version_name, version_timestamp, created_at \
              FROM {application_versions} ORDER BY version_timestamp DESC",
             application_versions = self.tables.application_versions
@@ -3521,7 +3522,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn get_latest_application_version(&self) -> Result<Option<VersionInfo>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT version_id, version_name, version_timestamp, created_at \
              FROM {application_versions} ORDER BY version_timestamp DESC LIMIT 1",
             application_versions = self.tables.application_versions
@@ -3532,7 +3533,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn set_latest_application_version(&self, version_name: &str) -> Result<bool> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE {application_versions} SET version_timestamp = $1 WHERE version_name = $2",
             application_versions = self.tables.application_versions
         ))
@@ -3570,7 +3571,7 @@ impl StateProvider for PostgresProvider {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) {conflict}",
             queues = self.tables.queues
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&queue.name)
             .bind(queue.global_concurrency.map(|n| n as i32))
@@ -3588,7 +3589,7 @@ impl StateProvider for PostgresProvider {
     }
 
     async fn list_queues(&self) -> Result<Vec<WorkflowQueue>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sql!(
             "SELECT name, concurrency, worker_concurrency, rate_limit_max, \
              rate_limit_period_sec, priority_enabled, partition_queue, polling_interval_sec \
              FROM {queues} ORDER BY name",
@@ -3611,7 +3612,7 @@ impl StateProvider for PostgresProvider {
         if export_children {
             let mut queue = vec![workflow_id.to_string()];
             while let Some(parent) = queue.pop() {
-                let children: Vec<(String,)> = sqlx::query_as(&format!(
+                let children: Vec<(String,)> = sqlx::query_as(sql!(
                     "SELECT workflow_uuid FROM {workflow_status} \
                      WHERE parent_workflow_id = $1 ORDER BY workflow_uuid ASC",
                     workflow_status = self.tables.workflow_status
@@ -3628,7 +3629,7 @@ impl StateProvider for PostgresProvider {
 
         let mut exported = Vec::with_capacity(ids.len());
         for id in &ids {
-            let status_row = sqlx::query(&format!(
+            let status_row = sqlx::query(sql!(
                 "SELECT * FROM {workflow_status} WHERE workflow_uuid = $1",
                 workflow_status = self.tables.workflow_status
             ))
@@ -3640,14 +3641,14 @@ impl StateProvider for PostgresProvider {
             };
             let workflow_status = export_status_map(&status_row);
 
-            let op_rows = sqlx::query(&format!("SELECT * FROM {operation_outputs} WHERE workflow_uuid = $1 ORDER BY function_id ASC", operation_outputs = self.tables.operation_outputs),
+            let op_rows = sqlx::query(sql!("SELECT * FROM {operation_outputs} WHERE workflow_uuid = $1 ORDER BY function_id ASC", operation_outputs = self.tables.operation_outputs),
             )
             .bind(id)
             .fetch_all(&mut *tx)
             .await?;
             let operation_outputs = op_rows.iter().map(export_op_map).collect();
 
-            let event_rows = sqlx::query(&format!(
+            let event_rows = sqlx::query(sql!(
                 "SELECT * FROM {workflow_events} WHERE workflow_uuid = $1 ORDER BY key ASC",
                 workflow_events = self.tables.workflow_events
             ))
@@ -3656,7 +3657,7 @@ impl StateProvider for PostgresProvider {
             .await?;
             let workflow_events = event_rows.iter().map(export_event_map).collect();
 
-            let history_rows = sqlx::query(&format!(
+            let history_rows = sqlx::query(sql!(
                 "SELECT * FROM {workflow_events_history} WHERE workflow_uuid = $1 \
                  ORDER BY function_id ASC, key ASC",
                 workflow_events_history = self.tables.workflow_events_history
@@ -3666,7 +3667,7 @@ impl StateProvider for PostgresProvider {
             .await?;
             let workflow_events_history = history_rows.iter().map(export_history_map).collect();
 
-            let stream_rows = sqlx::query(&format!(
+            let stream_rows = sqlx::query(sql!(
                 "SELECT * FROM {streams} WHERE workflow_uuid = $1 ORDER BY key ASC, \"offset\" ASC",
                 streams = self.tables.streams
             ))
@@ -3692,7 +3693,7 @@ impl StateProvider for PostgresProvider {
         let mut tx = self.pool.begin().await?;
         for wf in workflows {
             let s = &wf.workflow_status;
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "INSERT INTO {workflow_status}
                      (workflow_uuid, status, name, authenticated_user, assumed_role,
                       authenticated_roles, output, error, executor_id, created_at, updated_at,
@@ -3750,7 +3751,7 @@ impl StateProvider for PostgresProvider {
             .await?;
 
             for op in &wf.operation_outputs {
-                sqlx::query(&format!(
+                sqlx::query(sql!(
                     "INSERT INTO {operation_outputs}
                          (workflow_uuid, function_id, function_name, output, error,
                           child_workflow_id, started_at_epoch_ms, completed_at_epoch_ms, serialization)
@@ -3771,7 +3772,7 @@ impl StateProvider for PostgresProvider {
             }
 
             for ev in &wf.workflow_events {
-                sqlx::query(&format!(
+                sqlx::query(sql!(
                     "INSERT INTO {workflow_events} (workflow_uuid, key, value) VALUES ($1, $2, $3)",
                     workflow_events = self.tables.workflow_events
                 ))
@@ -3783,7 +3784,7 @@ impl StateProvider for PostgresProvider {
             }
 
             for h in &wf.workflow_events_history {
-                sqlx::query(&format!(
+                sqlx::query(sql!(
                     "INSERT INTO {workflow_events_history} (workflow_uuid, function_id, key, value)
                      VALUES ($1, $2, $3, $4)",
                     workflow_events_history = self.tables.workflow_events_history
@@ -3797,7 +3798,7 @@ impl StateProvider for PostgresProvider {
             }
 
             for st in &wf.streams {
-                sqlx::query(&format!(
+                sqlx::query(sql!(
                     "INSERT INTO {streams} (workflow_uuid, key, value, \"offset\", function_id)
                      VALUES ($1, $2, $3, $4, $5)",
                     streams = self.tables.streams
@@ -3819,7 +3820,7 @@ impl StateProvider for PostgresProvider {
             .filter_map(|wf| col_str(&wf.workflow_status, "forked_from"))
             .collect();
         if !sources.is_empty() {
-            sqlx::query(&format!(
+            sqlx::query(sql!(
                 "UPDATE {workflow_status} SET was_forked_from = TRUE WHERE workflow_uuid = ANY($1)",
                 workflow_status = self.tables.workflow_status
             ))
@@ -4029,14 +4030,14 @@ fn row_to_step(serializer: &Serializer, row: &sqlx::postgres::PgRow) -> Result<S
 }
 
 /// Append the WHERE clause shared by `list_workflows` (Postgres dialect).
-fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, filter: &'a ListFilter) {
+fn push_list_filters<'a>(qb: &mut QueryBuilder<Postgres>, filter: &'a ListFilter) {
     let mut sep = " WHERE ";
-    let mut clause = |qb: &mut QueryBuilder<'a, Postgres>| {
+    let mut clause = |qb: &mut QueryBuilder<Postgres>| {
         qb.push(sep);
         sep = " AND ";
     };
     // `col = ANY($n)` for a non-empty value set (OR-match).
-    let mut push_in = |qb: &mut QueryBuilder<'a, Postgres>, col: &str, vals: &'a [String]| {
+    let mut push_in = |qb: &mut QueryBuilder<Postgres>, col: &str, vals: &'a [String]| {
         if vals.is_empty() {
             return;
         }
@@ -4122,13 +4123,13 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, filter: &'a ListFi
 }
 
 /// Append the WHERE clause for `get_workflow_aggregates` (Postgres dialect).
-fn push_agg_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a WorkflowAggregateQuery) {
+fn push_agg_filters<'a>(qb: &mut QueryBuilder<Postgres>, q: &'a WorkflowAggregateQuery) {
     let mut sep = " WHERE ";
-    let mut clause = |qb: &mut QueryBuilder<'a, Postgres>| {
+    let mut clause = |qb: &mut QueryBuilder<Postgres>| {
         qb.push(sep);
         sep = " AND ";
     };
-    let mut push_in = |qb: &mut QueryBuilder<'a, Postgres>, col: &str, vals: &'a [String]| {
+    let mut push_in = |qb: &mut QueryBuilder<Postgres>, col: &str, vals: &'a [String]| {
         if vals.is_empty() {
             return;
         }
@@ -4197,9 +4198,9 @@ fn row_to_aggregate(
 }
 
 /// Append the WHERE clause for `get_step_aggregates` (Postgres dialect).
-fn push_step_agg_filters<'a>(qb: &mut QueryBuilder<'a, Postgres>, q: &'a StepAggregateQuery) {
+fn push_step_agg_filters(qb: &mut QueryBuilder<Postgres>, q: &StepAggregateQuery) {
     let mut sep = " WHERE ";
-    let mut clause = |qb: &mut QueryBuilder<'a, Postgres>| {
+    let mut clause = |qb: &mut QueryBuilder<Postgres>| {
         qb.push(sep);
         sep = " AND ";
     };

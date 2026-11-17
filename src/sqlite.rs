@@ -64,7 +64,7 @@ impl SqliteProvider {
         // per insert and never update it); it is stamped for cross-SDK schema
         // parity but plays no part in this SDK's arbitration — the returned
         // `created` flag is the equivalent "did this call create the row" test.
-        let created = sqlx::query(&format!(
+        let created = sqlx::query(sql!(
             "INSERT INTO workflow_status
                  (workflow_uuid, name, inputs, status, executor_id, application_version,
                   queue_name, queue_partition_key, priority, deduplication_id, parent_workflow_id,
@@ -109,7 +109,7 @@ impl SqliteProvider {
         .rows_affected()
             == 1;
 
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"
         ))
         .bind(&s.id)
@@ -638,7 +638,7 @@ async fn repair_timestamp_defaults(conn: &mut sqlx::SqliteConnection) -> Result<
         ),
         ("queues", &["created_at", "updated_at"][..]),
     ] {
-        let info = sqlx::query(&format!("PRAGMA table_info(\"{table}\")"))
+        let info = sqlx::query(sql!("PRAGMA table_info(\"{table}\")"))
             .fetch_all(&mut *conn)
             .await?;
         let missing: Vec<&str> = columns
@@ -675,24 +675,22 @@ async fn repair_timestamp_defaults(conn: &mut sqlx::SqliteConnection) -> Result<
             .ok_or_else(|| Error::app("invalid table definition"))?
             .1;
         let temporary = format!("__durare_defaults_{table}");
-        conn.execute(format!("CREATE TABLE \"{temporary}\" ({body}").as_str())
+        conn.execute(sql!("CREATE TABLE \"{temporary}\" ({body}"))
             .await?;
         let names = info
             .iter()
             .map(|row| format!("\"{}\"", row.get::<String, _>("name").replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(", ");
-        conn.execute(
-            format!("INSERT INTO \"{temporary}\" ({names}) SELECT {names} FROM \"{table}\"")
-                .as_str(),
-        )
+        conn.execute(sql!(
+            "INSERT INTO \"{temporary}\" ({names}) SELECT {names} FROM \"{table}\""
+        ))
         .await?;
-        conn.execute(format!("DROP TABLE \"{table}\"").as_str())
-            .await?;
-        conn.execute(format!("ALTER TABLE \"{temporary}\" RENAME TO \"{table}\"").as_str())
+        conn.execute(sql!("DROP TABLE \"{table}\"")).await?;
+        conn.execute(sql!("ALTER TABLE \"{temporary}\" RENAME TO \"{table}\""))
             .await?;
         for sql in objects {
-            conn.execute(sql.as_str()).await?;
+            conn.execute(sqlx::AssertSqlSafe(sql.as_str())).await?;
         }
     }
     if sqlx::query("PRAGMA foreign_key_check")
@@ -710,7 +708,7 @@ async fn repair_timestamp_defaults(conn: &mut sqlx::SqliteConnection) -> Result<
 /// The version the shared ledger records; `None` before it exists or has its
 /// row.
 async fn ledger_version(conn: &mut sqlx::SqliteConnection) -> Result<Option<i64>> {
-    let read = sqlx::query_scalar(&format!(
+    let read = sqlx::query_scalar(sql!(
         "SELECT version FROM {ledger} LIMIT 1",
         ledger = crate::migrate::LEDGER
     ))
@@ -733,7 +731,7 @@ async fn legacy_ledger_version(conn: &mut sqlx::SqliteConnection) -> Result<Opti
     if exists == 0 {
         return Ok(None);
     }
-    Ok(sqlx::query_scalar(&format!(
+    Ok(sqlx::query_scalar(sql!(
         "SELECT max(version) FROM {legacy} WHERE success",
         legacy = crate::migrate::LEGACY_LEDGER
     ))
@@ -753,7 +751,7 @@ async fn recorded_schema_version(conn: &mut sqlx::SqliteConnection) -> Result<Op
 /// Move the ledger's single row to `version`, creating it on first use, the way
 /// the other SDKs write it.
 async fn record_schema_version(conn: &mut sqlx::SqliteConnection, version: i64) -> Result<()> {
-    let updated = sqlx::query(&format!(
+    let updated = sqlx::query(sql!(
         "UPDATE {ledger} SET version = ?",
         ledger = crate::migrate::LEDGER
     ))
@@ -762,7 +760,7 @@ async fn record_schema_version(conn: &mut sqlx::SqliteConnection, version: i64) 
     .await?
     .rows_affected();
     if updated == 0 {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO {ledger} (version) VALUES (?)",
             ledger = crate::migrate::LEDGER
         ))
@@ -814,7 +812,7 @@ impl StateProvider for SqliteProvider {
         conn.execute("PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON")
             .await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "CREATE TABLE IF NOT EXISTS {ledger} (version BIGINT NOT NULL PRIMARY KEY)",
             ledger = crate::migrate::LEDGER
         ))
@@ -852,7 +850,7 @@ impl StateProvider for SqliteProvider {
             }
         }
         for migration in crate::migrate::pending(&MIGRATOR, applied) {
-            (&mut *tx).execute(&*migration.sql).await?;
+            (&mut *tx).execute(migration.sql.clone()).await?;
             tracing::info!(
                 version = migration.version,
                 "applied system schema migration"
@@ -864,12 +862,9 @@ impl StateProvider for SqliteProvider {
             record_schema_version(&mut tx, reached).await?;
         }
         tx.commit().await?;
-        conn.execute(
-            format!(
-                "PRAGMA foreign_keys = {foreign_keys}; PRAGMA legacy_alter_table = {legacy_alter}"
-            )
-            .as_str(),
-        )
+        conn.execute(sql!(
+            "PRAGMA foreign_keys = {foreign_keys}; PRAGMA legacy_alter_table = {legacy_alter}"
+        ))
         .await?;
         drop(guarded.0.take());
         Ok(())
@@ -905,7 +900,7 @@ impl StateProvider for SqliteProvider {
     }
 
     async fn get_workflow_status(&self, id: &str) -> Result<Option<WorkflowStatus>> {
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT {SELECT_COLS} FROM workflow_status WHERE workflow_uuid = ?"
         ))
         .bind(id)
@@ -942,7 +937,7 @@ impl StateProvider for SqliteProvider {
         };
         // Reaching a terminal state frees the queue-scoped deduplication slot so
         // the same deduplication id can be enqueued again.
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "UPDATE workflow_status
              SET status = ?,
                  output = COALESCE(?, output),
@@ -1379,7 +1374,7 @@ impl StateProvider for SqliteProvider {
                  WHERE queue_name = ? AND rate_limited = TRUE
                    AND status NOT IN (?, ?) AND started_at_epoch_ms > ?{part_clause}"
             );
-            let mut q = sqlx::query_scalar(&sql)
+            let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .bind(&req.queue_name)
                 .bind(STATUS_ENQUEUED)
                 .bind(STATUS_DELAYED)
@@ -1395,7 +1390,7 @@ impl StateProvider for SqliteProvider {
             let sql = format!(
                 "SELECT COUNT(*) FROM workflow_status WHERE queue_name = ? AND status = ?{part_clause}"
             );
-            let mut q = sqlx::query_scalar(&sql)
+            let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .bind(&req.queue_name)
                 .bind(STATUS_PENDING);
             if let Some(p) = part {
@@ -1436,7 +1431,7 @@ impl StateProvider for SqliteProvider {
              ORDER BY priority ASC, created_at ASC
              LIMIT ?"
         );
-        let mut q = sqlx::query_scalar(&sql)
+        let mut q = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
             .bind(&req.queue_name)
             .bind(STATUS_ENQUEUED)
             .bind(&req.app_version);
@@ -1448,7 +1443,7 @@ impl StateProvider for SqliteProvider {
         let rate_limited = req.rate_limit_max.is_some();
         let mut claimed = Vec::with_capacity(ids.len());
         for id in &ids {
-            let row = sqlx::query(&format!(
+            let row = sqlx::query(sql!(
                 "UPDATE workflow_status
                  SET status = ?, executor_id = ?, application_version = ?,
                      started_at_epoch_ms = ?, rate_limited = ?, updated_at = ?,
@@ -2209,7 +2204,7 @@ impl StateProvider for SqliteProvider {
             "recovery_attempts = recovery_attempts + 1, executor_id = ?, updated_at = ?"
         };
         let sql = format!("UPDATE workflow_status SET {set} {cas}");
-        let mut q = sqlx::query(&sql);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
         if attempts <= req.max_attempts && !req.requeue {
             q = q.bind(req.new_executor);
         }
@@ -2273,7 +2268,7 @@ impl StateProvider for SqliteProvider {
             None => {
                 // BEGIN IMMEDIATE owns SQLite's writer lock. A conflicting
                 // dedup slot cannot disappear between the insert and this read.
-                let row = sqlx::query(&format!(
+                let row = sqlx::query(sql!(
                     "SELECT {SELECT_COLS} FROM workflow_status WHERE queue_name = ? AND deduplication_id = ?"
                 ))
                 .bind(&child.queue_name)
@@ -2358,7 +2353,7 @@ impl StateProvider for SqliteProvider {
         workflow_id: &str,
         options: StepListOptions,
     ) -> Result<Vec<StepInfo>> {
-        let rows = sqlx::query(&format!(
+        let rows = sqlx::query(sql!(
             "SELECT function_id, function_name, {output}, error, child_workflow_id,
                     started_at_epoch_ms, completed_at_epoch_ms, serialization
              FROM operation_outputs
@@ -2742,7 +2737,7 @@ impl StateProvider for SqliteProvider {
               polling_interval_sec, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) {conflict}"
         );
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(uuid::Uuid::new_v4().to_string())
             .bind(&queue.name)
             .bind(queue.global_concurrency)
@@ -3195,21 +3190,21 @@ fn row_to_step(serializer: &Serializer, row: &sqlx::sqlite::SqliteRow) -> Result
 /// Append the WHERE clause shared by `list_workflows` (SQLite dialect).
 /// Push a comma-separated `?, ?, …` of bound values for an `IN (...)` clause.
 /// Values are bound as owned `String`s so the list need not outlive the builder.
-fn push_bind_list<T: AsRef<str>>(qb: &mut QueryBuilder<'_, Sqlite>, items: &[T]) {
+fn push_bind_list<T: AsRef<str>>(qb: &mut QueryBuilder<Sqlite>, items: &[T]) {
     let mut sep = qb.separated(", ");
     for it in items {
         sep.push_bind(it.as_ref().to_owned());
     }
 }
 
-fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilter) {
+fn push_list_filters<'a>(qb: &mut QueryBuilder<Sqlite>, filter: &'a ListFilter) {
     let mut sep = " WHERE ";
-    let mut clause = |qb: &mut QueryBuilder<'a, Sqlite>| {
+    let mut clause = |qb: &mut QueryBuilder<Sqlite>| {
         qb.push(sep);
         sep = " AND ";
     };
     // `col IN (?, ?, …)` for a non-empty value set (OR-match).
-    let mut push_in = |qb: &mut QueryBuilder<'a, Sqlite>, col: &str, vals: &'a [String]| {
+    let mut push_in = |qb: &mut QueryBuilder<Sqlite>, col: &str, vals: &'a [String]| {
         if vals.is_empty() {
             return;
         }
@@ -3298,13 +3293,13 @@ fn push_list_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, filter: &'a ListFilt
 }
 
 /// Append the WHERE clause for `get_workflow_aggregates` (SQLite dialect).
-fn push_agg_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, q: &'a WorkflowAggregateQuery) {
+fn push_agg_filters<'a>(qb: &mut QueryBuilder<Sqlite>, q: &'a WorkflowAggregateQuery) {
     let mut sep = " WHERE ";
-    let mut clause = |qb: &mut QueryBuilder<'a, Sqlite>| {
+    let mut clause = |qb: &mut QueryBuilder<Sqlite>| {
         qb.push(sep);
         sep = " AND ";
     };
-    let mut push_in = |qb: &mut QueryBuilder<'a, Sqlite>, col: &str, vals: &'a [String]| {
+    let mut push_in = |qb: &mut QueryBuilder<Sqlite>, col: &str, vals: &'a [String]| {
         if vals.is_empty() {
             return;
         }
@@ -3378,9 +3373,9 @@ fn row_to_aggregate(
 }
 
 /// Append the WHERE clause for `get_step_aggregates` (SQLite dialect).
-fn push_step_agg_filters<'a>(qb: &mut QueryBuilder<'a, Sqlite>, q: &'a StepAggregateQuery) {
+fn push_step_agg_filters(qb: &mut QueryBuilder<Sqlite>, q: &StepAggregateQuery) {
     let mut sep = " WHERE ";
-    let mut clause = |qb: &mut QueryBuilder<'a, Sqlite>| {
+    let mut clause = |qb: &mut QueryBuilder<Sqlite>| {
         qb.push(sep);
         sep = " AND ";
     };

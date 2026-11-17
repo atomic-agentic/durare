@@ -827,7 +827,7 @@ async fn duplicate_fast_path_identical_checkpoint_converges() -> Result<()> {
 }
 
 async fn order_count_in(pool: &sqlx::SqlitePool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(pool)
         .await
         .unwrap()

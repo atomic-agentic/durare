@@ -208,11 +208,11 @@ impl PgDataSource {
         // the schema and references it, always quoted, so the two sides
         // case-fold identically. The system path must stay unquoted instead
         // because its name is also seen unquoted by `search_path`.
-        sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+        sqlx::query(sql!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
             .execute(&pool)
             .await?;
         let table = format!("\"{schema}\".transaction_completion");
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "CREATE TABLE IF NOT EXISTS {table} (
                  workflow_id TEXT NOT NULL,
                  step_id INT NOT NULL,
@@ -283,7 +283,9 @@ impl sealed::Backend for PgDataSource {
             if read_only {
                 stmt.push_str(" READ ONLY");
             }
-            sqlx::query(&stmt).execute(&mut *tx).await?;
+            sqlx::query(sqlx::AssertSqlSafe(stmt))
+                .execute(&mut *tx)
+                .await?;
         }
         Ok(tx)
     }
@@ -314,7 +316,7 @@ impl sealed::Backend for PgDataSource {
         step_id: i32,
     ) -> Result<Option<CompletionRow>> {
         use sqlx::Row as _;
-        let row = sqlx::query(&format!(
+        let row = sqlx::query(sql!(
             "SELECT output, error, serialization FROM {} WHERE workflow_id = $1 AND step_id = $2",
             self.table
         ))
@@ -338,7 +340,7 @@ impl sealed::Backend for PgDataSource {
         error: Option<&str>,
         serialization: &str,
     ) -> Result<bool> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "INSERT INTO {} ({COMPLETION_COLUMNS}) VALUES ($1, $2, $3, $4, $5, $6)
              ON CONFLICT (workflow_id, step_id) DO NOTHING",
             self.table
@@ -361,7 +363,7 @@ impl sealed::Backend for PgDataSource {
         error: &str,
         serialization: &str,
     ) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO {} ({COMPLETION_COLUMNS}) VALUES ($1, $2, NULL, $3, $4, $5)
              ON CONFLICT (workflow_id, step_id) DO NOTHING",
             self.table
@@ -392,7 +394,7 @@ impl sealed::Backend for PgDataSource {
     ) -> Result<bool> {
         // Fully qualified (when the minting provider's schema is known), so
         // nothing the body does to `search_path` can redirect the checkpoint.
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "INSERT INTO {} (workflow_uuid, function_id, function_name, output, serialization,
                              started_at_epoch_ms, completed_at_epoch_ms)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -534,7 +536,7 @@ impl sealed::Backend for SqliteDataSource {
         error: Option<&str>,
         serialization: &str,
     ) -> Result<bool> {
-        let res = sqlx::query(&format!(
+        let res = sqlx::query(sql!(
             "INSERT INTO transaction_completion ({COMPLETION_COLUMNS})
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT (workflow_id, step_id) DO NOTHING"
@@ -557,7 +559,7 @@ impl sealed::Backend for SqliteDataSource {
         error: &str,
         serialization: &str,
     ) -> Result<()> {
-        sqlx::query(&format!(
+        sqlx::query(sql!(
             "INSERT INTO transaction_completion ({COMPLETION_COLUMNS})
              VALUES (?, ?, NULL, ?, ?, ?)
              ON CONFLICT (workflow_id, step_id) DO NOTHING"

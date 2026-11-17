@@ -1138,7 +1138,7 @@ async fn postgres_transaction_machinery_faults_are_not_recorded() -> Result<()> 
         } else {
             ""
         };
-        sqlx::raw_sql(&format!("CREATE TABLE {schema}.effects (id INTEGER); CREATE FUNCTION {schema}.reject_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'checkpoint unavailable' USING ERRCODE = '53100'; END $$; CREATE {timing} ON {schema}.operation_outputs {deferred} FOR EACH ROW WHEN (NEW.output IS NOT NULL) EXECUTE FUNCTION {schema}.reject_checkpoint();"))
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE TABLE {schema}.effects (id INTEGER); CREATE FUNCTION {schema}.reject_checkpoint() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'checkpoint unavailable' USING ERRCODE = '53100'; END $$; CREATE {timing} ON {schema}.operation_outputs {deferred} FOR EACH ROW WHEN (NEW.output IS NOT NULL) EXECUTE FUNCTION {schema}.reject_checkpoint();")))
             .execute(&admin).await?;
         let retries = Arc::new(AtomicUsize::new(0));
         let counted = retries.clone();
@@ -1179,16 +1179,16 @@ async fn postgres_transaction_machinery_faults_are_not_recorded() -> Result<()> 
             STATUS_PENDING
         );
         assert_eq!(retries.load(Ordering::SeqCst), 0);
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {schema}.effects"))
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {schema}.effects")))
             .fetch_one(&admin)
             .await?;
         assert_eq!(
             count, 0,
             "the failed checkpoint rolls back application writes"
         );
-        sqlx::raw_sql(&format!(
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "DROP TRIGGER fail_checkpoint ON {schema}.operation_outputs"
-        ))
+        )))
         .execute(&admin)
         .await?;
         let owner = provider
@@ -1206,16 +1206,18 @@ async fn postgres_transaction_machinery_faults_are_not_recorded() -> Result<()> 
             .unwrap()?,
             42
         );
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {schema}.effects"))
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {schema}.effects")))
             .fetch_one(&admin)
             .await?;
         assert_eq!(count, 1);
         engine.shutdown(Duration::from_secs(5)).await?;
         Ok::<(), Error>(())
         }).catch_unwind().await;
-        let cleanup = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(&admin)
-            .await;
+        let cleanup = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE"
+        )))
+        .execute(&admin)
+        .await;
         match result {
             Ok(outcome) => {
                 cleanup?;
@@ -1301,9 +1303,11 @@ async fn postgres_interrupted_queue_recovers_capacity() -> Result<()> {
     })
     .catch_unwind()
     .await;
-    let cleanup = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&admin)
-        .await;
+    let cleanup = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&admin)
+    .await;
     let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     cleanup?;
     result
@@ -2601,9 +2605,11 @@ async fn postgres_transaction_output_encoding_skips_body_retries() -> Result<()>
     })
     .catch_unwind()
     .await;
-    let cleanup = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&admin)
-        .await;
+    let cleanup = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE"
+    )))
+    .execute(&admin)
+    .await;
     let result = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     cleanup?;
     result
