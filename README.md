@@ -159,13 +159,14 @@ cargo run --example order                                  # resumes; does not r
 
 ## Cargo features
 
-Backends are compiled behind features, all on by default; enable just one to
-drop the other's driver. **At least one backend is required** — a build with
+Backends are compiled behind features. This fork enables only `sqlite` by
+default; add `postgres` for a Postgres deployment, or build Postgres alone to
+drop SQLite's driver. **At least one backend is required** — a build with
 neither is a compile error. `InMemoryProvider` is always available (no feature).
 
 | Feature | Default | Enables |
 | --- | --- | --- |
-| `postgres` | ✅ | The `PostgresProvider` backend (sqlx Postgres driver). |
+| `postgres` | — | The `PostgresProvider` backend (sqlx Postgres driver). |
 | `sqlite` | ✅ | The `SqliteProvider` backend (sqlx SQLite driver — a bundled C library). |
 | `conductor` | — | The DBOS Conductor client (`Conductor`, `ConductorConfig`, `AlertHandler`) — a websocket client for the DBOS control plane; pulls in a TLS websocket stack and gzip framing. |
 | `admin` | — | The `AdminServer` HTTP control surface — health, recovery, and workflow-management endpoints for the DBOS console/conductor and health probes; pulls in the axum/hyper/tower stack. |
@@ -219,7 +220,7 @@ against the workflow database, which is why they exist as a separate primitive.
 
 All three implement one trait, `StateProvider`, which is also the seam for
 adding further backends. `PostgresProvider` and `SqliteProvider` are gated by the
-`postgres` and `sqlite` [Cargo features](#cargo-features) (both on by default);
+`postgres` and `sqlite` [Cargo features](#cargo-features) (`sqlite` is on by default);
 `InMemoryProvider` is always available. Application tests can run workflows
 against `InMemoryProvider` with no infrastructure at all; the crate's own test
 suite runs against all three backends on every commit, with Postgres against a

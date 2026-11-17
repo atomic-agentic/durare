@@ -99,6 +99,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bundled SQLite with unlock-notify, as sqlx 0.8 did, and no longer enables
   extension loading. Dynamic SQL is marked audited for sqlx 0.9's `SqlSafeStr`
   check; only validated identifiers are interpolated, and values stay bound.
+- Only the `sqlite` backend is enabled by default; `postgres` is opt-in, so a
+  default build links no Postgres driver.
 
 - Migration 44 drops the per-row `workflow_events` NOTIFY trigger migration 1
   created, as the Go and Python SDKs do at that index. A Postgres provider now

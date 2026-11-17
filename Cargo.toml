@@ -42,12 +42,13 @@ members = ["durare-macros"]
 resolver = "3"
 
 [features]
-# Backends are on by default. Enable just one to drop the other's driver: a
-# Postgres-only build skips SQLite's bundled C library, and a SQLite-only build
-# skips the Postgres network/TLS driver. At least one backend is required — a
+# Only SQLite is on by default in this fork, so a default build links no
+# Postgres network/TLS driver; enable `postgres` for a Postgres deployment. A
+# Postgres-only build (`default-features = false, features = ["postgres"]`)
+# skips SQLite's bundled C library. At least one backend is required — a
 # zero-backend build is a compile error (the in-memory backend is always
 # available, but the crate needs a SQL connection type to build).
-default = ["postgres", "sqlite"]
+default = ["sqlite"]
 # Postgres backend (`PostgresProvider`): pulls in the sqlx Postgres driver.
 postgres = ["sqlx/postgres"]
 # SQLite backend (`SqliteProvider`): pulls in the sqlx SQLite driver (a bundled

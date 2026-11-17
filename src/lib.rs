@@ -130,12 +130,13 @@
 //!
 //! # Cargo features
 //!
-//! Backends are compiled behind features, all on by default; enable just one to
-//! drop the other's driver. **At least one backend is required** — a
+//! Backends are compiled behind features. Only `sqlite` is on by default; add
+//! `postgres` for a Postgres deployment, or build Postgres alone to drop
+//! SQLite's driver. **At least one backend is required** — a
 //! zero-backend build is a compile error. [`InMemoryProvider`] is always
 //! available (no feature).
 //!
-//! - **`postgres`** *(default)* — the [`PostgresProvider`] backend.
+//! - **`postgres`** *(off by default)* — the [`PostgresProvider`] backend.
 //! - **`sqlite`** *(default)* — the [`SqliteProvider`] backend (a bundled C
 //!   library; drop it with `default-features = false, features = ["postgres"]`
 //!   for a pure-Postgres build that needs no C toolchain).
@@ -163,7 +164,7 @@
 #[cfg(not(any(feature = "postgres", feature = "sqlite")))]
 compile_error!(
     "durare needs at least one SQL backend feature: enable `postgres` and/or \
-     `sqlite` (both are on by default)."
+     `sqlite` (`sqlite` is on by default)."
 );
 
 // Concept guides — std-style module pages (think `std::pin`) that each explain
