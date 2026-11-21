@@ -3625,3 +3625,79 @@ async fn sqlite_transaction_step_that_waits_on_its_own_lock_fails_after_ten_conf
     }
     Ok(())
 }
+
+/// Another writer holding the lock for longer than many busy timeouts is not
+/// the step's own fault: its begin waits and retries until the lock clears,
+/// however many times that takes, and then its body runs once. Only conflicts
+/// the body itself returns count toward the cap. Through the provider and
+/// through its system data source alike.
+#[tokio::test]
+async fn sqlite_transaction_step_waits_out_a_long_writer_and_runs_its_body_once() -> Result<()> {
+    use durare::params;
+    for via_datasource in [false, true] {
+        let (url, path) = temp_db_url("long-writer");
+        // The step's own connections wait 100 ms for a lock: a 3 s writer is
+        // some thirty busy begins.
+        // Made, migrated and switched to WAL by an ordinary connect first.
+        drop(SqliteProvider::connect(&url).await?);
+        let provider = Arc::new(SqliteProvider::from_pool(impatient_pool(&url, 100).await?));
+        let ds = provider.system_datasource();
+        let mut engine = DurableEngine::new(provider.clone()).await?;
+        let other = sqlx::SqlitePool::connect(&format!("{url}?mode=rwc")).await?;
+        sqlx::query("CREATE TABLE IF NOT EXISTS side (x INTEGER)")
+            .execute(&other)
+            .await?;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let go = Arc::new(tokio::sync::Notify::new());
+        let (counted, wf_ready, wf_go) = (runs.clone(), ready.clone(), go.clone());
+        engine.register("w", move |ctx: DurableContext, _: ()| {
+            let (counted, ready, go, ds) =
+                (counted.clone(), wf_ready.clone(), wf_go.clone(), ds.clone());
+            async move {
+                ready.notify_one();
+                go.notified().await;
+                if via_datasource {
+                    ctx.transaction_on(&ds, "after-the-writer", async move |conn| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        sqlx::query("INSERT INTO side (x) VALUES (1)")
+                            .execute(&mut *conn)
+                            .await?;
+                        Ok(())
+                    })
+                    .await?;
+                } else {
+                    ctx.transaction::<(), _>("after-the-writer", move |tx| {
+                        let counted = counted.clone();
+                        Box::pin(async move {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            tx.execute("INSERT INTO side (x) VALUES (1)", &params![])
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .await?;
+                }
+                Ok::<_, Error>(())
+            }
+        });
+        let handle: durare::WorkflowHandle<()> = engine
+            .start("w", (), WorkflowOptions::with_id("wf"))
+            .await?;
+        ready.notified().await;
+        let writer = other.begin_with("BEGIN IMMEDIATE").await?;
+        go.notify_one();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        writer.commit().await?;
+        tokio::time::timeout(Duration::from_secs(30), handle.result())
+            .await
+            .expect("the step finished once the writer let go")?;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "datasource {via_datasource}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}

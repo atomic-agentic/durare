@@ -1297,7 +1297,9 @@ impl StateProvider for SqliteProvider {
                         // error retries on a fresh tx, an application error is left for
                         // the outer user-retry loop (recorded only once the budget is
                         // spent).
-                        Err(e) if e.should_retry_live_transaction() => Err(e),
+                        Err(e) if e.should_retry_live_transaction() => {
+                            Ok(TransactionAttempt::BodyConflicted(e))
+                        }
                         Err(e) => {
                             tx.rollback().await?;
                             Ok(TransactionAttempt::BodyFailed(e))
@@ -1309,19 +1311,31 @@ impl StateProvider for SqliteProvider {
                 match outcome {
                     Ok(TransactionAttempt::Committed(v)) => return Ok(v),
                     Ok(TransactionAttempt::BodyFailed(e)) => break 'conflict e,
-                    // A conflict (SQLITE_BUSY / SQLITE_LOCKED) or transient DB error:
-                    // retry on a fresh transaction, backing off and bailing if the
-                    // workflow is cancelled. A transient error is retried until it
-                    // clears, as Go/Python do; a lock conflict has already waited
-                    // out the busy timeout, and ten in a row is a lock that does
-                    // not clear (see `SQLITE_CONFLICT_RETRIES`).
-                    Err(e) if e.should_retry_live_transaction() => {
+                    // The body's own conflict: one in a row more when it is a
+                    // lock conflict, which has already waited out the busy
+                    // timeout; ten in a row is a body waiting on its own step.
+                    Ok(TransactionAttempt::BodyConflicted(e)) => {
                         if e.is_tx_conflict() {
                             lock_conflicts = lock_conflicts.saturating_add(1);
                             if lock_conflicts >= crate::tx::SQLITE_CONFLICT_RETRIES {
                                 break 'conflict crate::tx::conflicted_too_often(name, &e);
                             }
+                        } else {
+                            lock_conflicts = 0;
                         }
+                        crate::tx::warn_retry(workflow_id, seq, name, conflict_attempt, &e);
+                        self.conflict_retry_wait(workflow_id, conflict_attempt)
+                            .await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
+                    }
+                    // A conflict (SQLITE_BUSY / SQLITE_LOCKED) or transient DB error:
+                    // in beginning, checkpointing or committing the transaction:
+                    // retry on a fresh transaction until it clears, as Go/Python
+                    // do, backing off and bailing if the workflow is cancelled.
+                    // Another writer holding the lock ends this way, and so does
+                    // not count toward the body's lock conflicts.
+                    Err(e) if e.should_retry_live_transaction() => {
+                        lock_conflicts = 0;
                         crate::tx::warn_retry(workflow_id, seq, name, conflict_attempt, &e);
                         self.conflict_retry_wait(workflow_id, conflict_attempt)
                             .await?;

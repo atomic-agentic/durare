@@ -98,11 +98,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   source, system or external. The writer lock is held for the whole body, so
   keep transactional bodies short. A step marked `read_only` still begins
   deferred, so one that writes anyway can still run its body again.
-- On SQLite, a transactional step that meets a lock conflict ten times in a
-  row now fails with an error saying so, instead of retrying forever: a body
-  that writes to the same database through another connection waits on the
-  step's own lock and can never finish. Transient errors are still retried
-  until they clear, and cancelling the workflow still stops the retries.
+- On SQLite, a transactional step whose body returns a lock conflict ten
+  times in a row now fails with an error saying so, instead of retrying
+  forever: a body that writes to the same database through another connection
+  waits on the step's own lock and can never finish. A conflict in beginning
+  the transaction, as when another writer holds the lock, is not the body's and
+  is still retried until it clears, as are transient errors; cancelling the
+  workflow still stops the retries.
 - A transactional step's conflict retry, on SQLite and Postgres, logs a
   warning on its first retry and at every power-of-two attempt after it,
   naming the workflow, step and attempt.

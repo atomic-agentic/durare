@@ -107,9 +107,9 @@
 //!   but writes serialize; the 5-second busy timeout absorbs contention. A
 //!   transactional step that may write holds the writer lock for its whole
 //!   body, so keep bodies short: every other writer waits on them. A
-//!   transactional step retries `SQLITE_BUSY`/`SQLITE_LOCKED` conflicts up to
-//!   ten times in a row, then fails (transient errors are retried until they
-//!   clear); a body that writes to the same database
+//!   transactional step whose body returns `SQLITE_BUSY`/`SQLITE_LOCKED` ten
+//!   times in a row fails (a busy begin, waiting on another writer, and
+//!   transient errors are retried until they clear); a body that writes to the same database
 //!   through another connection waits on the step's own lock and fails that
 //!   way. Throughput ceilings are write-rate ceilings.
 //! - **No push signals**: blocked `recv`/`get_event` poll (25ms), so a very

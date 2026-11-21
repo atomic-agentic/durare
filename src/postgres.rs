@@ -1983,6 +1983,14 @@ impl StateProvider for PostgresProvider {
                 match outcome {
                     Ok(TransactionAttempt::Committed(v)) => return Ok(v),
                     Ok(TransactionAttempt::BodyFailed(e)) => break 'conflict e,
+                    // Postgres conflicts clear on their own: retried until they
+                    // do, wherever they arose.
+                    Ok(TransactionAttempt::BodyConflicted(e)) => {
+                        crate::tx::warn_retry(workflow_id, seq, name, conflict_attempt, &e);
+                        self.conflict_retry_wait(workflow_id, conflict_attempt)
+                            .await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
+                    }
                     // A transaction conflict or transient DB error: retry on a fresh
                     // transaction, unbounded, backing off and bailing if the workflow
                     // is cancelled. Matches Go/Python, which retry these until they
