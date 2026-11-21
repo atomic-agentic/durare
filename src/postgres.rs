@@ -1988,6 +1988,14 @@ impl StateProvider for PostgresProvider {
                     // is cancelled. Matches Go/Python, which retry these until they
                     // clear rather than surfacing a spurious failure under contention.
                     Err(e) if e.should_retry_live_transaction() => {
+                        tracing::warn!(
+                            workflow_id,
+                            seq,
+                            step = name,
+                            attempt = conflict_attempt,
+                            error = %e,
+                            "transaction step conflicted with another writer; running it again"
+                        );
                         self.conflict_retry_wait(workflow_id, conflict_attempt)
                             .await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);

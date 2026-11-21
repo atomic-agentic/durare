@@ -1201,7 +1201,17 @@ impl StateProvider for SqliteProvider {
             let mut conflict_attempt: u32 = 0;
             let body_err = 'conflict: loop {
                 let outcome = async {
-                    let mut tx = self.pool.begin().await?;
+                    // A step that may write takes the writer lock before its
+                    // body runs, as every other write path here does. Begun
+                    // deferred, its first write (at the latest, the checkpoint)
+                    // would fail with SQLITE_BUSY_SNAPSHOT whenever another
+                    // connection committed after the body's first read, and
+                    // the body would run again. A read-only step needs no lock.
+                    let mut tx = if opts.read_only {
+                        self.pool.begin().await?
+                    } else {
+                        self.pool.begin_with("BEGIN IMMEDIATE").await?
+                    };
                     // Run the user's body against this transaction. (Replay is
                     // handled up front, before the retry loops.)
                     let body_result = {
@@ -1298,6 +1308,14 @@ impl StateProvider for SqliteProvider {
                     // if the workflow is cancelled. Matches Go/Python, which retry
                     // these until they clear rather than failing under contention.
                     Err(e) if e.should_retry_live_transaction() => {
+                        tracing::warn!(
+                            workflow_id,
+                            seq,
+                            step = name,
+                            attempt = conflict_attempt,
+                            error = %e,
+                            "transaction step conflicted with another writer; running it again"
+                        );
                         self.conflict_retry_wait(workflow_id, conflict_attempt)
                             .await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);

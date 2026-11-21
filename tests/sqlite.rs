@@ -3429,3 +3429,61 @@ async fn sqlite_read_only_transaction_records_checkpoint() -> Result<()> {
     let _ = std::fs::remove_file(&path);
     Ok(())
 }
+
+/// A transactional step that may write holds the writer lock from its start:
+/// another connection that commits while the body runs waits for the step,
+/// so the step's checkpoint never meets a newer snapshot and its body runs
+/// once. Begun deferred, the body's first read took a snapshot, the other
+/// connection committed past it, and the checkpoint's write failed with
+/// SQLITE_BUSY_SNAPSHOT, running the body again.
+#[tokio::test]
+async fn sqlite_transaction_step_runs_once_while_another_connection_writes() -> Result<()> {
+    use durare::params;
+    let (url, path) = temp_db_url("txn-immediate");
+    let mut engine = DurableEngine::new(Arc::new(SqliteProvider::connect(&url).await?)).await?;
+    // Another connection to the same file, as another process would be.
+    let other = sqlx::SqlitePool::connect(&format!("{url}?mode=rwc")).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS side (x INTEGER)")
+        .execute(&other)
+        .await?;
+    let runs = Arc::new(AtomicUsize::new(0));
+    let reading = Arc::new(tokio::sync::Notify::new());
+    let writer = {
+        let (other, reading) = (other.clone(), reading.clone());
+        tokio::spawn(async move {
+            reading.notified().await;
+            sqlx::query("INSERT INTO side (x) VALUES (1)")
+                .execute(&other)
+                .await
+                .map_err(Error::from)
+        })
+    };
+    let (counted, signal) = (runs.clone(), reading.clone());
+    engine.register("w", move |ctx: DurableContext, _: ()| {
+        let (counted, signal) = (counted.clone(), signal.clone());
+        async move {
+            ctx.transaction::<(), _>("read-then-write", move |tx| {
+                let (counted, signal) = (counted.clone(), signal.clone());
+                Box::pin(async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    tx.execute("SELECT COUNT(*) FROM side", &params![]).await?;
+                    // The other connection writes while the body still runs.
+                    signal.notify_one();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    Ok(())
+                })
+            })
+            .await?;
+            Ok::<_, Error>(())
+        }
+    });
+    let handle: durare::WorkflowHandle<()> = engine
+        .start("w", (), WorkflowOptions::with_id("wf"))
+        .await?;
+    handle.result().await?;
+    let written: sqlx::sqlite::SqliteQueryResult = writer.await.expect("writer task")?;
+    assert_eq!(written.rows_affected(), 1);
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran again");
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
