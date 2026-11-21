@@ -1147,9 +1147,14 @@ impl StateProvider for SqliteProvider {
         opts: &TransactionOptions,
         body: TxBody<'_>,
     ) -> Result<Value> {
-        // SQLite runs every transaction serializably, so the isolation level and
-        // read-only flag are advisory here. We still retry on SQLITE_BUSY /
-        // SQLITE_LOCKED, the SQLite analog of a transaction conflict.
+        // SQLite runs every transaction serializably, so the isolation level is
+        // advisory here. The read-only flag chooses the lock: a step that may
+        // write begins IMMEDIATE and holds the writer lock while its body runs;
+        // a read-only one begins deferred, so one marked read-only that writes
+        // anyway can still fail at its write with SQLITE_BUSY_SNAPSHOT and run
+        // its body again. SQLITE_BUSY / SQLITE_LOCKED, the SQLite analog of a
+        // transaction conflict, are retried, at most SQLITE_CONFLICT_RETRIES
+        // times in a row.
         use crate::tx::TransactionAttempt;
         let name = opts.name.as_str();
         // Replay: a previously recorded outcome — a committed success or a durable
@@ -1199,9 +1204,20 @@ impl StateProvider for SqliteProvider {
         let mut user_attempt: u32 = 0;
         loop {
             let mut conflict_attempt: u32 = 0;
+            let mut lock_conflicts: u32 = 0;
             let body_err = 'conflict: loop {
                 let outcome = async {
-                    let mut tx = self.pool.begin().await?;
+                    // A step that may write takes the writer lock before its
+                    // body runs, as every other write path here does. Begun
+                    // deferred, its first write (at the latest, the checkpoint)
+                    // would fail with SQLITE_BUSY_SNAPSHOT whenever another
+                    // connection committed after the body's first read, and
+                    // the body would run again. A read-only step needs no lock.
+                    let mut tx = if opts.read_only {
+                        self.pool.begin().await?
+                    } else {
+                        self.pool.begin_with("BEGIN IMMEDIATE").await?
+                    };
                     // Run the user's body against this transaction. (Replay is
                     // handled up front, before the retry loops.)
                     let body_result = {
@@ -1281,7 +1297,9 @@ impl StateProvider for SqliteProvider {
                         // error retries on a fresh tx, an application error is left for
                         // the outer user-retry loop (recorded only once the budget is
                         // spent).
-                        Err(e) if e.should_retry_live_transaction() => Err(e),
+                        Err(e) if e.should_retry_live_transaction() => {
+                            Ok(TransactionAttempt::BodyConflicted(e))
+                        }
                         Err(e) => {
                             tx.rollback().await?;
                             Ok(TransactionAttempt::BodyFailed(e))
@@ -1293,11 +1311,32 @@ impl StateProvider for SqliteProvider {
                 match outcome {
                     Ok(TransactionAttempt::Committed(v)) => return Ok(v),
                     Ok(TransactionAttempt::BodyFailed(e)) => break 'conflict e,
+                    // The body's own conflict: one in a row more when it is a
+                    // lock conflict, which has already waited out the busy
+                    // timeout; ten in a row is a body waiting on its own step.
+                    Ok(TransactionAttempt::BodyConflicted(e)) => {
+                        if e.is_tx_conflict() {
+                            lock_conflicts = lock_conflicts.saturating_add(1);
+                            if lock_conflicts >= crate::tx::SQLITE_CONFLICT_RETRIES {
+                                break 'conflict crate::tx::conflicted_too_often(name, &e);
+                            }
+                        } else {
+                            lock_conflicts = 0;
+                        }
+                        crate::tx::warn_retry(workflow_id, seq, name, conflict_attempt, &e);
+                        self.conflict_retry_wait(workflow_id, conflict_attempt)
+                            .await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
+                    }
                     // A conflict (SQLITE_BUSY / SQLITE_LOCKED) or transient DB error:
-                    // retry on a fresh transaction, unbounded, backing off and bailing
-                    // if the workflow is cancelled. Matches Go/Python, which retry
-                    // these until they clear rather than failing under contention.
+                    // in beginning, checkpointing or committing the transaction:
+                    // retry on a fresh transaction until it clears, as Go/Python
+                    // do, backing off and bailing if the workflow is cancelled.
+                    // Another writer holding the lock ends this way, and so does
+                    // not count toward the body's lock conflicts.
                     Err(e) if e.should_retry_live_transaction() => {
+                        lock_conflicts = 0;
+                        crate::tx::warn_retry(workflow_id, seq, name, conflict_attempt, &e);
                         self.conflict_retry_wait(workflow_id, conflict_attempt)
                             .await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);

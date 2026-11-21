@@ -90,6 +90,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- On SQLite, a transactional step that is not read-only begins `IMMEDIATE`,
+  taking the writer lock before its body runs, as the provider's other write
+  paths do. Begun deferred, it failed with `SQLITE_BUSY_SNAPSHOT` at its first
+  write whenever another connection committed after the body's first read, and
+  its body ran again. The same holds for `transaction_on` over a SQLite data
+  source, system or external. The writer lock is held for the whole body, so
+  keep transactional bodies short. A step marked `read_only` still begins
+  deferred, so one that writes anyway can still run its body again.
+- On SQLite, a transactional step whose body returns a lock conflict ten
+  times in a row now fails with an error saying so, instead of retrying
+  forever: a body that writes to the same database through another connection
+  waits on the step's own lock and can never finish. A conflict in beginning
+  the transaction, as when another writer holds the lock, is not the body's and
+  is still retried until it clears, as are transient errors; cancelling the
+  workflow still stops the retries.
+- A transactional step's conflict retry, on SQLite and Postgres, logs a
+  warning on its first retry and at every power-of-two attempt after it,
+  naming the workflow, step and attempt.
+
 - Requires sqlx 0.9 instead of 0.8, so durare links beside other crates that
   pin sqlx 0.9 and `libsqlite3-sys` 0.39 in one dependency graph. sqlx-core,
   sqlx-sqlite and sqlx-postgres come from `transact-rs/sqlx` at

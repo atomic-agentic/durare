@@ -26,6 +26,12 @@ use std::time::Duration;
 pub(crate) enum TransactionAttempt {
     Committed(Value),
     BodyFailed(Error),
+    /// The body itself returned a conflict or transient database error: its
+    /// transaction rolled back, and it runs again. Kept apart from the same
+    /// errors raised by the transaction's machinery (its begin, checkpoint or
+    /// commit), so that only the body's lock conflicts count toward
+    /// [`SQLITE_CONFLICT_RETRIES`].
+    BodyConflicted(Error),
 }
 
 /// A bound parameter for transactional-step SQL. Build these with
@@ -334,8 +340,13 @@ impl IsolationLevel {
 /// application errors raised by the body.
 ///
 /// Two retry layers apply, matching the reference SDK. A transaction-level
-/// **conflict** (serialization / deadlock / `SQLITE_BUSY`) is always retried on
-/// a fresh transaction and never counts against the budget below. An
+/// **conflict** (serialization / deadlock / `SQLITE_BUSY`) is retried on a fresh
+/// transaction and never counts against the budget below, with one exception:
+/// on SQLite, a lock conflict the body itself returns ten times in a row, as a
+/// body that writes through another connection to the same database does,
+/// fails the step with an application error, which this policy then sees. A
+/// conflict in beginning the transaction, such as waiting on another writer,
+/// is retried until it clears. An
 /// **application error** returned by the body is retried only if `max_retries`
 /// allows it (and any [`retry_if`](Self::retry_if) predicate accepts it), with
 /// exponential backoff; the whole body re-runs on a new transaction. Only after
@@ -369,7 +380,8 @@ pub struct TransactionOptions {
     /// `false` stops retries immediately even with attempts remaining, so a
     /// permanent error fails fast. `None` (the default) retries body errors up to
     /// `max_retries`. Durable-scope violations bypass this policy and predicate.
-    /// A live transaction conflict is retried regardless of this.
+    /// A live transaction conflict is retried regardless of this, except the
+    /// SQLite lock conflicts a body returns ten times in a row (see above).
     pub retry_if: Option<RetryPredicate>,
 }
 
@@ -531,6 +543,51 @@ fn bind_sqlite<'q>(
         };
     }
     q
+}
+
+/// How many lock conflicts (`SQLITE_BUSY`, `SQLITE_LOCKED`, a busy snapshot)
+/// in a row the body of a transactional step on SQLite may return before the
+/// step fails. Each has already waited out the connection's busy timeout.
+/// SQLite has one writer, which the step holds while its body runs: a body
+/// that waits on a lock, as a write through another connection to the same
+/// file does, waits on its own step and would otherwise retry forever. Only
+/// conflicts the body returns count, and any other retry starts the count
+/// again: a conflict in beginning the transaction (another writer holds the
+/// lock), a transient error, and Postgres conflicts are retried until they
+/// clear, as the reference SDKs do.
+pub(crate) const SQLITE_CONFLICT_RETRIES: u32 = 10;
+
+/// Log a transactional step's conflict retry: `retry` counts from zero, and
+/// the first retry and every power-of-two one after it are logged, so a long
+/// run of conflicts is visible without a line per attempt.
+pub(crate) fn warn_retry(
+    workflow_id: &str,
+    seq: i32,
+    step: &str,
+    retry: u32,
+    error: &crate::Error,
+) {
+    let attempt = retry.saturating_add(1);
+    if attempt.is_power_of_two() {
+        tracing::warn!(
+            workflow_id,
+            seq,
+            step,
+            attempt,
+            error = %error,
+            "transaction step hit a conflict or transient database error; running it again"
+        );
+    }
+}
+
+/// The error a transactional step on SQLite fails with once it has conflicted
+/// [`SQLITE_CONFLICT_RETRIES`] times in a row.
+pub(crate) fn conflicted_too_often(step: &str, error: &crate::Error) -> crate::Error {
+    crate::Error::app(format!(
+        "transaction step `{step}` conflicted with another writer {SQLITE_CONFLICT_RETRIES} times \
+         in a row and was given up ({error}); a body that writes to the same SQLite database \
+         through another connection waits on this step's own lock and can never finish"
+    ))
 }
 
 #[cfg(test)]

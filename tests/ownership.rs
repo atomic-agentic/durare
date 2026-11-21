@@ -317,6 +317,84 @@ async fn queued_row_recovery_requeues_exactly_once() {
     let _ = std::fs::remove_file(&db);
 }
 
+/// Run transactional step `step` at `seq` of `wf-txr` while a rival executor
+/// checkpoints the same position with `rival_name` and `rival_output`, in the
+/// one window a step that may write leaves open: after it looked for a
+/// recorded outcome, before it takes the writer lock. The rival holds the lock
+/// with its row written; the step starts, finds nothing recorded, and waits on
+/// the lock; then the rival commits. The step's body inserts `app_value` into
+/// `app_t` and returns `output`.
+#[allow(clippy::too_many_arguments)]
+async fn raced_step(
+    provider: &Arc<SqliteProvider>,
+    rival: &sqlx::SqlitePool,
+    seq: i32,
+    started_at_ms: i64,
+    step: &'static str,
+    rival_name: &str,
+    rival_output: String,
+    fmt: &str,
+    app_value: &'static str,
+    output: serde_json::Value,
+) -> durare::Result<serde_json::Value> {
+    use durare::TransactionOptions;
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let mut held = rival
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("the rival takes the lock");
+    sqlx::query(
+        "INSERT INTO operation_outputs
+             (workflow_uuid, function_id, function_name, output, serialization,
+              started_at_epoch_ms, completed_at_epoch_ms)
+         VALUES ('wf-txr', ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(seq)
+    .bind(rival_name)
+    .bind(&rival_output)
+    .bind(fmt)
+    .bind(started_at_ms)
+    .bind(started_at_ms)
+    .execute(&mut *held)
+    .await
+    .expect("the rival's checkpoint");
+    let running = {
+        let provider = provider.clone();
+        tokio::spawn(async move {
+            provider
+                .run_transaction_step(
+                    "wf-txr",
+                    seq,
+                    started_at_ms,
+                    &TransactionOptions::new(step),
+                    Box::new(move |tx| {
+                        let output = output.clone();
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            tx.execute(
+                                &format!("INSERT INTO app_t (x) VALUES ('{app_value}')"),
+                                &durare::params![],
+                            )
+                            .await?;
+                            Ok(output)
+                        })
+                    }),
+                )
+                .await
+        })
+    };
+    // Long enough for the step to look, find nothing, and wait on the lock;
+    // well inside the lock's busy timeout.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    held.commit().await.expect("the rival commits");
+    let result = running.await.expect("the step's task");
+    // The step waited on the rival's lock, then ran its body once: it did
+    // race, and lost, rather than run before or after the rival.
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "step {step}'s body runs");
+    result
+}
+
 /// A transactional step that loses its checkpoint race must roll back the
 /// body's writes and classify the stored row: an identical write (same name,
 /// content, start instant) converges, a divergent one is
@@ -325,7 +403,6 @@ async fn queued_row_recovery_requeues_exactly_once() {
 /// *committed* — applying the body's writes a second time.
 #[tokio::test(flavor = "multi_thread")]
 async fn losing_a_transaction_checkpoint_race_is_a_conflict() {
-    use durare::TransactionOptions;
     use serde_json::json;
 
     let (db, url) = unique_db("txn-conflict");
@@ -351,6 +428,7 @@ async fn losing_a_transaction_checkpoint_race_is_a_conflict() {
         .await
         .expect("insert");
     let ser = provider.serializer();
+    let fmt = ser.name().to_string();
     let app_rows = |pool: sqlx::SqlitePool| async move {
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM app_t")
             .fetch_one(&pool)
@@ -358,42 +436,20 @@ async fn losing_a_transaction_checkpoint_race_is_a_conflict() {
             .expect("count")
     };
 
-    // Divergent rival at seq 0, planted from inside the body before this
-    // transaction takes SQLite's write lock — indistinguishable from a rival
-    // committing in the race window.
-    let fmt = ser.name().to_string();
-    let (rp, planted, fmtc) = (
-        rival.clone(),
+    // A divergent rival at seq 0.
+    let res = raced_step(
+        &provider,
+        &rival,
+        0,
+        1_000,
+        "racy",
+        "racy",
         ser.encode(&json!("rival")).expect("enc"),
-        fmt.clone(),
-    );
-    let res = provider
-        .run_transaction_step(
-            "wf-txr",
-            0,
-            1_000,
-            &TransactionOptions::new("racy"),
-            Box::new(move |tx| {
-                let (rp, planted, fmt) = (rp.clone(), planted.clone(), fmtc.clone());
-                Box::pin(async move {
-                    sqlx::query(
-                        "INSERT INTO operation_outputs
-                             (workflow_uuid, function_id, function_name, output, serialization,
-                              started_at_epoch_ms, completed_at_epoch_ms)
-                         VALUES ('wf-txr', 0, 'racy', ?, ?, 2000, 2000)",
-                    )
-                    .bind(&planted)
-                    .bind(&fmt)
-                    .execute(&rp)
-                    .await
-                    .map_err(durare::Error::from)?;
-                    tx.execute("INSERT INTO app_t (x) VALUES ('mine')", &durare::params![])
-                        .await?;
-                    Ok(json!(42))
-                })
-            }),
-        )
-        .await;
+        &fmt,
+        "mine",
+        json!(42),
+    )
+    .await;
     assert!(
         matches!(res, Err(durare::Error::WorkflowConflict(ref id)) if id == "wf-txr"),
         "a divergent rival write must be a conflict, got {res:?}"
@@ -404,41 +460,22 @@ async fn losing_a_transaction_checkpoint_race_is_a_conflict() {
         "the losing body's writes must roll back, not commit"
     );
 
-    // Identical write at seq 1 (same name, content, and start instant): a
-    // replay/retry of the same logical write — converges, no conflict. The
-    // rolled-back attempt's own app write still must not commit.
-    let (rp, planted, fmtc) = (
-        rival.clone(),
+    // An identical write at seq 1 (same name, content, and start instant): a
+    // replay or retry of the same logical write converges, with no conflict.
+    // The rolled-back attempt's own app write still must not commit.
+    let res = raced_step(
+        &provider,
+        &rival,
+        1,
+        5_000,
+        "same",
+        "same",
         ser.encode(&json!(7)).expect("enc"),
-        fmt.clone(),
-    );
-    let res = provider
-        .run_transaction_step(
-            "wf-txr",
-            1,
-            5_000,
-            &TransactionOptions::new("same"),
-            Box::new(move |tx| {
-                let (rp, planted, fmt) = (rp.clone(), planted.clone(), fmtc.clone());
-                Box::pin(async move {
-                    sqlx::query(
-                        "INSERT INTO operation_outputs
-                             (workflow_uuid, function_id, function_name, output, serialization,
-                              started_at_epoch_ms, completed_at_epoch_ms)
-                         VALUES ('wf-txr', 1, 'same', ?, ?, 5000, 5000)",
-                    )
-                    .bind(&planted)
-                    .bind(&fmt)
-                    .execute(&rp)
-                    .await
-                    .map_err(durare::Error::from)?;
-                    tx.execute("INSERT INTO app_t (x) VALUES ('mine2')", &durare::params![])
-                        .await?;
-                    Ok(json!(7))
-                })
-            }),
-        )
-        .await;
+        &fmt,
+        "mine2",
+        json!(7),
+    )
+    .await;
     assert!(
         matches!(res, Ok(ref v) if *v == json!(7)),
         "an identical write converges on the stored outcome, got {res:?}"
@@ -450,38 +487,24 @@ async fn losing_a_transaction_checkpoint_race_is_a_conflict() {
     );
 
     // A different step name at the position stays non-determinism.
-    let rp = rival.clone();
-    let planted = ser.encode(&json!(1)).expect("enc");
-    let fmtc = fmt.clone();
-    let res = provider
-        .run_transaction_step(
-            "wf-txr",
-            2,
-            9_000,
-            &TransactionOptions::new("renamed"),
-            Box::new(move |_tx| {
-                let (rp, planted, fmt) = (rp.clone(), planted.clone(), fmtc.clone());
-                Box::pin(async move {
-                    sqlx::query(
-                        "INSERT INTO operation_outputs
-                             (workflow_uuid, function_id, function_name, output, serialization,
-                              started_at_epoch_ms, completed_at_epoch_ms)
-                         VALUES ('wf-txr', 2, 'original', ?, ?, 9000, 9000)",
-                    )
-                    .bind(&planted)
-                    .bind(&fmt)
-                    .execute(&rp)
-                    .await
-                    .map_err(durare::Error::from)?;
-                    Ok(json!(1))
-                })
-            }),
-        )
-        .await;
+    let res = raced_step(
+        &provider,
+        &rival,
+        2,
+        9_000,
+        "renamed",
+        "original",
+        ser.encode(&json!(1)).expect("enc"),
+        &fmt,
+        "mine3",
+        json!(1),
+    )
+    .await;
     assert!(
         matches!(res, Err(durare::Error::UnexpectedStep { .. })),
         "a renamed step at a recorded position is non-determinism, got {res:?}"
     );
+    assert_eq!(app_rows(rival.clone()).await, 0);
 
     let _ = std::fs::remove_file(&db);
 }

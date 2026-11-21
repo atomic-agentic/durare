@@ -1779,10 +1779,37 @@ impl DurableContext {
             // transient DB error rolls back and retries on a fresh transaction
             // — unbounded (until it clears or the workflow is cancelled).
             let mut conflict_attempt: u32 = 0;
+            let mut lock_conflicts: u32 = 0;
             let outcome = loop {
                 match self.datasource_attempt(ds, opts, f, seq, &ser).await {
                     Ok(DsAttempt::Committed(value)) => break Ok(value),
                     Ok(DsAttempt::BodyFailed(error)) => break Err(error),
+                    // The body's own conflict: one in a row more when it is a
+                    // lock conflict, which has already waited out the busy
+                    // timeout; where the backend caps them, that many in a row
+                    // is a body waiting on its own step.
+                    Ok(DsAttempt::BodyConflicted(e)) => {
+                        if e.is_tx_conflict() {
+                            lock_conflicts = lock_conflicts.saturating_add(1);
+                            if ds
+                                .conflict_retry_limit()
+                                .is_some_and(|limit| lock_conflicts >= limit)
+                            {
+                                break Err(crate::tx::conflicted_too_often(&opts.name, &e));
+                            }
+                        } else {
+                            lock_conflicts = 0;
+                        }
+                        crate::tx::warn_retry(
+                            &self.workflow_id,
+                            seq,
+                            &opts.name,
+                            conflict_attempt,
+                            &e,
+                        );
+                        self.datasource_conflict_wait(conflict_attempt).await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
+                    }
                     // Another execution committed this step first. An identical
                     // stored row is a replay/retry of this same logical write —
                     // converge on it. A divergent one is a live rival execution:
@@ -1809,6 +1836,18 @@ impl DurableContext {
                             .await;
                     }
                     Err(e) if e.should_retry_live_transaction() => {
+                        // In beginning, checkpointing or committing: retried
+                        // until it clears, and not counted toward the body's
+                        // lock conflicts (another writer holding the lock ends
+                        // this way).
+                        lock_conflicts = 0;
+                        crate::tx::warn_retry(
+                            &self.workflow_id,
+                            seq,
+                            &opts.name,
+                            conflict_attempt,
+                            &e,
+                        );
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
@@ -1946,7 +1985,7 @@ impl DurableContext {
             Err(e) => {
                 ds.rollback(tx).await?;
                 if e.should_retry_live_transaction() {
-                    Err(e)
+                    Ok(DsAttempt::BodyConflicted(e))
                 } else {
                     Ok(DsAttempt::BodyFailed(e))
                 }
@@ -1978,6 +2017,7 @@ impl DurableContext {
         let mut user_attempt: u32 = 0;
         let body_err = loop {
             let mut conflict_attempt: u32 = 0;
+            let mut lock_conflicts: u32 = 0;
             let outcome = loop {
                 match self
                     .system_datasource_attempt(ds, opts, f, seq, ser, started)
@@ -1985,6 +2025,32 @@ impl DurableContext {
                 {
                     Ok(DsAttempt::Committed(value)) => break Ok(value),
                     Ok(DsAttempt::BodyFailed(error)) => break Err(error),
+                    // The body's own conflict: one in a row more when it is a
+                    // lock conflict, which has already waited out the busy
+                    // timeout; where the backend caps them, that many in a row
+                    // is a body waiting on its own step.
+                    Ok(DsAttempt::BodyConflicted(e)) => {
+                        if e.is_tx_conflict() {
+                            lock_conflicts = lock_conflicts.saturating_add(1);
+                            if ds
+                                .conflict_retry_limit()
+                                .is_some_and(|limit| lock_conflicts >= limit)
+                            {
+                                break Err(crate::tx::conflicted_too_often(&opts.name, &e));
+                            }
+                        } else {
+                            lock_conflicts = 0;
+                        }
+                        crate::tx::warn_retry(
+                            &self.workflow_id,
+                            seq,
+                            &opts.name,
+                            conflict_attempt,
+                            &e,
+                        );
+                        self.datasource_conflict_wait(conflict_attempt).await?;
+                        conflict_attempt = conflict_attempt.saturating_add(1);
+                    }
                     // Another execution checkpointed this step first. An
                     // identical recorded output is a replay/retry of this same
                     // logical write — converge on it. Anything else is a live
@@ -2011,6 +2077,18 @@ impl DurableContext {
                         return self.recorded_value(StepOutcome::Output(value));
                     }
                     Err(e) if e.should_retry_live_transaction() => {
+                        // In beginning, checkpointing or committing: retried
+                        // until it clears, and not counted toward the body's
+                        // lock conflicts (another writer holding the lock ends
+                        // this way).
+                        lock_conflicts = 0;
+                        crate::tx::warn_retry(
+                            &self.workflow_id,
+                            seq,
+                            &opts.name,
+                            conflict_attempt,
+                            &e,
+                        );
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
@@ -2142,7 +2220,7 @@ impl DurableContext {
             Err(e) => {
                 ds.rollback(tx).await?;
                 if e.should_retry_live_transaction() {
-                    Err(e)
+                    Ok(DsAttempt::BodyConflicted(e))
                 } else {
                     Ok(DsAttempt::BodyFailed(e))
                 }
@@ -3229,6 +3307,10 @@ enum DsAttempt {
     Committed(Value),
     /// A user body failure, distinct from transaction/checkpoint machinery.
     BodyFailed(Error),
+    /// The body itself returned a conflict or transient database error; its
+    /// transaction rolled back. Kept apart from the machinery's errors, so
+    /// that only the body's lock conflicts count toward a backend's limit.
+    BodyConflicted(Error),
     /// A completion row already existed — another execution committed this
     /// step first, and this attempt rolled back. Carries the output this
     /// attempt computed, so the caller can classify the stored row: identical
