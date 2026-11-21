@@ -11,6 +11,7 @@ use durare::{
 };
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 mod common;
 
@@ -670,9 +671,11 @@ async fn foreign_system_datasource_is_rejected() -> Result<()> {
 /// A duplicate execution that loses the fast-path checkpoint race to a
 /// *divergent* rival write stops there: its writes roll back, no later step
 /// runs, and the caller receives the rival's recorded workflow outcome. The
-/// rival's checkpoint and completion are planted from inside the body over a
-/// separate connection, landing in the exact window between the body's writes
-/// and this attempt's checkpoint insert.
+/// rival commits its checkpoint, and finishes the workflow, in the window a
+/// step that may write leaves open: after the step looked for a recorded
+/// outcome, before it takes the writer lock. The rival holds the lock with its
+/// rows written, the step finds nothing recorded and waits, and the rival
+/// commits.
 #[tokio::test]
 async fn duplicate_fast_path_divergent_checkpoint_stops_the_loser() -> Result<()> {
     use durare::{SqliteProvider, StateProvider};
@@ -685,6 +688,7 @@ async fn duplicate_fast_path_divergent_checkpoint_stops_the_loser() -> Result<()
     let pool = ds.pool().clone();
     let runs = Arc::new(AtomicU32::new(0));
     let after_runs = Arc::new(AtomicU32::new(0));
+    let (ready, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
     sqlx::query("CREATE TABLE sys_orders (item TEXT NOT NULL)")
@@ -693,33 +697,17 @@ async fn duplicate_fast_path_divergent_checkpoint_stops_the_loser() -> Result<()
         .unwrap();
 
     let (wf_ds, wf_runs, wf_after) = (ds.clone(), runs.clone(), after_runs.clone());
-    let (rival_pool, rival_provider) = (pool.clone(), provider.clone());
+    let (wf_ready, wf_go) = (ready.clone(), go.clone());
     engine.register("sys-dup", move |ctx: DurableContext, (): ()| {
         let (ds, runs, after) = (wf_ds.clone(), wf_runs.clone(), wf_after.clone());
-        let (rival_pool, rival_provider) = (rival_pool.clone(), rival_provider.clone());
-        let wf_id = ctx.workflow_id().to_string();
+        let (ready, go) = (wf_ready.clone(), wf_go.clone());
         async move {
+            // The rival gets its moment just before the step.
+            ready.notify_one();
+            go.notified().await;
             let n: i64 = ctx
                 .transaction_on(&ds, "dup-tx", async move |conn| {
                     runs.fetch_add(1, Ordering::SeqCst);
-                    // The "other executor" commits a divergent checkpoint
-                    // for this step on a separate connection, right in the
-                    // race window — and then finishes the whole workflow.
-                    let ser = Serializer::Json;
-                    sqlx::query(
-                        "INSERT INTO operation_outputs
-                                 (workflow_uuid, function_id, function_name, output, serialization,
-                                  started_at_epoch_ms, completed_at_epoch_ms)
-                             VALUES (?, 0, 'dup-tx', ?, ?, 0, 0)",
-                    )
-                    .bind(&wf_id)
-                    .bind(ser.encode(&serde_json::json!(99))?)
-                    .bind(ser.name())
-                    .execute(&rival_pool)
-                    .await?;
-                    rival_provider
-                        .set_workflow_status(&wf_id, "SUCCESS", Some(&serde_json::json!(50)), None)
-                        .await?;
                     // This attempt's own write — must be rolled back.
                     sqlx::query("INSERT INTO sys_orders(item) VALUES ('duplicate')")
                         .execute(&mut *conn)
@@ -735,10 +723,39 @@ async fn duplicate_fast_path_divergent_checkpoint_stops_the_loser() -> Result<()
     });
     engine.launch().await?;
 
-    let n: i64 = engine
+    let handle = engine
         .start::<(), i64>("sys-dup", (), WorkflowOptions::with_id("sysds-dup"))
-        .await?
         .await?;
+    ready.notified().await;
+    // The "other executor": a divergent checkpoint for this step, and the
+    // whole workflow finished, in one transaction holding the writer lock.
+    let ser = Serializer::Json;
+    let mut rival = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query(
+        "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES ('sysds-dup', 0, 'dup-tx', ?, ?, 0, 0)",
+    )
+    .bind(ser.encode(&serde_json::json!(99))?)
+    .bind(ser.name())
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE workflow_status SET status = 'SUCCESS', output = ?, completed_at = 0, \
+         updated_at = 0 WHERE workflow_uuid = 'sysds-dup' AND status = 'PENDING'",
+    )
+    .bind(provider.serializer().encode(&serde_json::json!(50))?)
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+    go.notify_one();
+    // Long enough for the step to look, find nothing, and wait on the lock.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    rival.commit().await.unwrap();
+
+    let n: i64 = handle.await?;
     assert_eq!(n, 50, "the rival's recorded workflow outcome is adopted");
     assert_eq!(runs.load(Ordering::SeqCst), 1, "body ran once");
     assert_eq!(
@@ -756,7 +773,8 @@ async fn duplicate_fast_path_divergent_checkpoint_stops_the_loser() -> Result<()
 
 /// The counterpart: a rival row with *identical* content is a replay/retry of
 /// the same logical write — the loser converges on it and the workflow keeps
-/// running normally (its own transactional writes still rolled back).
+/// running normally (its own transactional writes still rolled back). The
+/// rival commits in the same window as the divergent case's.
 #[tokio::test]
 async fn duplicate_fast_path_identical_checkpoint_converges() -> Result<()> {
     use durare::SqliteProvider;
@@ -767,7 +785,9 @@ async fn duplicate_fast_path_identical_checkpoint_converges() -> Result<()> {
     let provider = Arc::new(SqliteProvider::connect(&url).await?);
     let ds = provider.system_datasource();
     let pool = ds.pool().clone();
+    let runs = Arc::new(AtomicU32::new(0));
     let after_runs = Arc::new(AtomicU32::new(0));
+    let (ready, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
     sqlx::query("CREATE TABLE sys_orders (item TEXT NOT NULL)")
@@ -775,27 +795,17 @@ async fn duplicate_fast_path_identical_checkpoint_converges() -> Result<()> {
         .await
         .unwrap();
 
-    let (wf_ds, wf_after, rival_pool) = (ds.clone(), after_runs.clone(), pool.clone());
+    let (wf_ds, wf_runs, wf_after) = (ds.clone(), runs.clone(), after_runs.clone());
+    let (wf_ready, wf_go) = (ready.clone(), go.clone());
     engine.register("sys-conv", move |ctx: DurableContext, (): ()| {
-        let (ds, after, rival_pool) = (wf_ds.clone(), wf_after.clone(), rival_pool.clone());
-        let wf_id = ctx.workflow_id().to_string();
+        let (ds, runs, after) = (wf_ds.clone(), wf_runs.clone(), wf_after.clone());
+        let (ready, go) = (wf_ready.clone(), wf_go.clone());
         async move {
+            ready.notify_one();
+            go.notified().await;
             let n: i64 = ctx
                 .transaction_on(&ds, "conv-tx", async move |conn| {
-                    // The rival's row records exactly what this body
-                    // returns: an ack-lost retry, not a divergence.
-                    let ser = Serializer::Json;
-                    sqlx::query(
-                        "INSERT INTO operation_outputs
-                                 (workflow_uuid, function_id, function_name, output, serialization,
-                                  started_at_epoch_ms, completed_at_epoch_ms)
-                             VALUES (?, 0, 'conv-tx', ?, ?, 0, 0)",
-                    )
-                    .bind(&wf_id)
-                    .bind(ser.encode(&serde_json::json!(1))?)
-                    .bind(ser.name())
-                    .execute(&rival_pool)
-                    .await?;
+                    runs.fetch_add(1, Ordering::SeqCst);
                     sqlx::query("INSERT INTO sys_orders(item) VALUES ('converge')")
                         .execute(&mut *conn)
                         .await?;
@@ -808,11 +818,32 @@ async fn duplicate_fast_path_identical_checkpoint_converges() -> Result<()> {
     });
     engine.launch().await?;
 
-    let n: i64 = engine
+    let handle = engine
         .start::<(), i64>("sys-conv", (), WorkflowOptions::with_id("sysds-conv"))
-        .await?
         .await?;
+    ready.notified().await;
+    // The rival's row records exactly what this body returns: an ack-lost
+    // retry, not a divergence.
+    let ser = Serializer::Json;
+    let mut rival = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query(
+        "INSERT INTO operation_outputs
+                 (workflow_uuid, function_id, function_name, output, serialization,
+                  started_at_epoch_ms, completed_at_epoch_ms)
+             VALUES ('sysds-conv', 0, 'conv-tx', ?, ?, 0, 0)",
+    )
+    .bind(ser.encode(&serde_json::json!(1))?)
+    .bind(ser.name())
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+    go.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    rival.commit().await.unwrap();
+
+    let n: i64 = handle.await?;
     assert_eq!(n, 2, "converged on the identical outcome and kept running");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran once, racing");
     assert_eq!(
         after_runs.load(Ordering::SeqCst),
         1,
@@ -836,7 +867,9 @@ async fn order_count_in(pool: &sqlx::SqlitePool, table: &str) -> i64 {
 /// The external two-commit path gets the same classification: a divergent
 /// rival *witness* row in the application database stops the loser, whose own
 /// writes rolled back with its transaction; the engine returns the rival's
-/// recorded workflow outcome and no later step runs.
+/// recorded workflow outcome and no later step runs. The rival commits its
+/// witness in the window the step leaves open on the application database,
+/// having finished the workflow in the system database.
 #[tokio::test]
 async fn duplicate_external_divergent_witness_stops_the_loser() -> Result<()> {
     use durare::{SqliteProvider, StateProvider};
@@ -846,35 +879,22 @@ async fn duplicate_external_divergent_witness_stops_the_loser() -> Result<()> {
     sys.push(format!("durare-ds-ext-dup-{}.db", uuid::Uuid::new_v4()));
     let provider =
         Arc::new(SqliteProvider::connect(&format!("sqlite://{}?mode=rwc", sys.display())).await?);
+    let runs = Arc::new(AtomicU32::new(0));
     let after_runs = Arc::new(AtomicU32::new(0));
+    let (ready, go) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
 
     let mut engine = DurableEngine::new(provider.clone()).await?;
-    let (wf_ds, wf_after) = (ds.clone(), after_runs.clone());
-    let (rival_pool, rival_provider) = (app_pool.clone(), provider.clone());
+    let (wf_ds, wf_runs, wf_after) = (ds.clone(), runs.clone(), after_runs.clone());
+    let (wf_ready, wf_go) = (ready.clone(), go.clone());
     engine.register("ext-dup", move |ctx: DurableContext, (): ()| {
-        let (ds, after) = (wf_ds.clone(), wf_after.clone());
-        let (rival_pool, rival_provider) = (rival_pool.clone(), rival_provider.clone());
-        let wf_id = ctx.workflow_id().to_string();
+        let (ds, runs, after) = (wf_ds.clone(), wf_runs.clone(), wf_after.clone());
+        let (ready, go) = (wf_ready.clone(), wf_go.clone());
         async move {
+            ready.notify_one();
+            go.notified().await;
             let n: i64 = ctx
                 .transaction_on(&ds, "ext-tx", async move |conn| {
-                    // The rival commits a divergent witness row in the
-                    // application database, then finishes the workflow in
-                    // the system database.
-                    let ser = Serializer::Json;
-                    sqlx::query(
-                        "INSERT INTO transaction_completion
-                                 (workflow_id, step_id, output, error, serialization, created_at)
-                             VALUES (?, 0, ?, NULL, ?, 0)",
-                    )
-                    .bind(&wf_id)
-                    .bind(ser.encode(&serde_json::json!(99))?)
-                    .bind(ser.name())
-                    .execute(&rival_pool)
-                    .await?;
-                    rival_provider
-                        .set_workflow_status(&wf_id, "SUCCESS", Some(&serde_json::json!(50)), None)
-                        .await?;
+                    runs.fetch_add(1, Ordering::SeqCst);
                     // This attempt's own write — must roll back.
                     sqlx::query("INSERT INTO orders(item) VALUES ('duplicate')")
                         .execute(&mut *conn)
@@ -888,11 +908,34 @@ async fn duplicate_external_divergent_witness_stops_the_loser() -> Result<()> {
     });
     engine.launch().await?;
 
-    let n: i64 = engine
+    let handle = engine
         .start::<(), i64>("ext-dup", (), WorkflowOptions::with_id("extds-dup"))
-        .await?
         .await?;
+    ready.notified().await;
+    // The rival finishes the workflow in the system database, then holds the
+    // application database's writer lock with a divergent witness row.
+    provider
+        .set_workflow_status("extds-dup", "SUCCESS", Some(&serde_json::json!(50)), None)
+        .await?;
+    let ser = Serializer::Json;
+    let mut rival = app_pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query(
+        "INSERT INTO transaction_completion
+                 (workflow_id, step_id, output, error, serialization, created_at)
+             VALUES ('extds-dup', 0, ?, NULL, ?, 0)",
+    )
+    .bind(ser.encode(&serde_json::json!(99))?)
+    .bind(ser.name())
+    .execute(&mut *rival)
+    .await
+    .unwrap();
+    go.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    rival.commit().await.unwrap();
+
+    let n: i64 = handle.await?;
     assert_eq!(n, 50, "the rival's recorded workflow outcome is adopted");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the body ran once, racing");
     assert_eq!(
         after_runs.load(Ordering::SeqCst),
         0,
