@@ -104,10 +104,14 @@
 //! durability contract. Its shape to plan around:
 //!
 //! - **One writer at a time.** WAL mode lets readers proceed under a writer,
-//!   but writes serialize; the 5-second busy timeout absorbs contention, and
-//!   transactional steps additionally retry `SQLITE_BUSY`/`SQLITE_LOCKED`
-//!   conflicts until they clear (or the workflow is cancelled). Throughput
-//!   ceilings are write-rate ceilings.
+//!   but writes serialize; the 5-second busy timeout absorbs contention. A
+//!   transactional step that may write holds the writer lock for its whole
+//!   body, so keep bodies short: every other writer waits on them. A
+//!   transactional step retries `SQLITE_BUSY`/`SQLITE_LOCKED` conflicts up to
+//!   ten times in a row, then fails (transient errors are retried until they
+//!   clear); a body that writes to the same database
+//!   through another connection waits on the step's own lock and fails that
+//!   way. Throughput ceilings are write-rate ceilings.
 //! - **No push signals**: blocked `recv`/`get_event` poll (25ms), so a very
 //!   large number of concurrent waiters is cheaper on Postgres.
 //! - It is a per-process database: two processes can share the file, but a

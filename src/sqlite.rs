@@ -1147,9 +1147,14 @@ impl StateProvider for SqliteProvider {
         opts: &TransactionOptions,
         body: TxBody<'_>,
     ) -> Result<Value> {
-        // SQLite runs every transaction serializably, so the isolation level and
-        // read-only flag are advisory here. We still retry on SQLITE_BUSY /
-        // SQLITE_LOCKED, the SQLite analog of a transaction conflict.
+        // SQLite runs every transaction serializably, so the isolation level is
+        // advisory here. The read-only flag chooses the lock: a step that may
+        // write begins IMMEDIATE and holds the writer lock while its body runs;
+        // a read-only one begins deferred, so one marked read-only that writes
+        // anyway can still fail at its write with SQLITE_BUSY_SNAPSHOT and run
+        // its body again. SQLITE_BUSY / SQLITE_LOCKED, the SQLite analog of a
+        // transaction conflict, are retried, at most SQLITE_CONFLICT_RETRIES
+        // times in a row.
         use crate::tx::TransactionAttempt;
         let name = opts.name.as_str();
         // Replay: a previously recorded outcome — a committed success or a durable
@@ -1199,6 +1204,7 @@ impl StateProvider for SqliteProvider {
         let mut user_attempt: u32 = 0;
         loop {
             let mut conflict_attempt: u32 = 0;
+            let mut lock_conflicts: u32 = 0;
             let body_err = 'conflict: loop {
                 let outcome = async {
                     // A step that may write takes the writer lock before its
@@ -1304,18 +1310,19 @@ impl StateProvider for SqliteProvider {
                     Ok(TransactionAttempt::Committed(v)) => return Ok(v),
                     Ok(TransactionAttempt::BodyFailed(e)) => break 'conflict e,
                     // A conflict (SQLITE_BUSY / SQLITE_LOCKED) or transient DB error:
-                    // retry on a fresh transaction, unbounded, backing off and bailing
-                    // if the workflow is cancelled. Matches Go/Python, which retry
-                    // these until they clear rather than failing under contention.
+                    // retry on a fresh transaction, backing off and bailing if the
+                    // workflow is cancelled. A transient error is retried until it
+                    // clears, as Go/Python do; a lock conflict has already waited
+                    // out the busy timeout, and ten in a row is a lock that does
+                    // not clear (see `SQLITE_CONFLICT_RETRIES`).
                     Err(e) if e.should_retry_live_transaction() => {
-                        tracing::warn!(
-                            workflow_id,
-                            seq,
-                            step = name,
-                            attempt = conflict_attempt,
-                            error = %e,
-                            "transaction step conflicted with another writer; running it again"
-                        );
+                        if e.is_tx_conflict() {
+                            lock_conflicts = lock_conflicts.saturating_add(1);
+                            if lock_conflicts >= crate::tx::SQLITE_CONFLICT_RETRIES {
+                                break 'conflict crate::tx::conflicted_too_often(name, &e);
+                            }
+                        }
+                        crate::tx::warn_retry(workflow_id, seq, name, conflict_attempt, &e);
                         self.conflict_retry_wait(workflow_id, conflict_attempt)
                             .await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);

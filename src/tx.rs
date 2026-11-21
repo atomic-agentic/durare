@@ -582,3 +582,45 @@ mod tests {
         assert!(empty.is_empty());
     }
 }
+
+/// How many lock conflicts (`SQLITE_BUSY`, `SQLITE_LOCKED`, a busy snapshot)
+/// in a row a transactional step on SQLite retries before it fails. Each has
+/// already waited out the connection's busy timeout. SQLite has one writer: a
+/// body that waits on a lock this step's own transaction holds, as a write
+/// through another connection to the same file does, conflicts every time
+/// and would otherwise retry forever. Transient errors, and Postgres
+/// conflicts, are retried until they clear, as the reference SDKs do.
+pub(crate) const SQLITE_CONFLICT_RETRIES: u32 = 10;
+
+/// Log a transactional step's conflict retry: `retry` counts from zero, and
+/// the first retry and every power-of-two one after it are logged, so a long
+/// run of conflicts is visible without a line per attempt.
+pub(crate) fn warn_retry(
+    workflow_id: &str,
+    seq: i32,
+    step: &str,
+    retry: u32,
+    error: &crate::Error,
+) {
+    let attempt = retry.saturating_add(1);
+    if attempt.is_power_of_two() {
+        tracing::warn!(
+            workflow_id,
+            seq,
+            step,
+            attempt,
+            error = %error,
+            "transaction step hit a conflict or transient database error; running it again"
+        );
+    }
+}
+
+/// The error a transactional step on SQLite fails with once it has conflicted
+/// [`SQLITE_CONFLICT_RETRIES`] times in a row.
+pub(crate) fn conflicted_too_often(step: &str, error: &crate::Error) -> crate::Error {
+    crate::Error::app(format!(
+        "transaction step `{step}` conflicted with another writer {SQLITE_CONFLICT_RETRIES} times \
+         in a row and was given up ({error}); a body that writes to the same SQLite database \
+         through another connection waits on this step's own lock and can never finish"
+    ))
+}

@@ -338,6 +338,8 @@ async fn raced_step(
     output: serde_json::Value,
 ) -> durare::Result<serde_json::Value> {
     use durare::TransactionOptions;
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
     let mut held = rival
         .begin_with("BEGIN IMMEDIATE")
         .await
@@ -368,6 +370,7 @@ async fn raced_step(
                     &TransactionOptions::new(step),
                     Box::new(move |tx| {
                         let output = output.clone();
+                        counted.fetch_add(1, Ordering::SeqCst);
                         Box::pin(async move {
                             tx.execute(
                                 &format!("INSERT INTO app_t (x) VALUES ('{app_value}')"),
@@ -385,7 +388,11 @@ async fn raced_step(
     // well inside the lock's busy timeout.
     tokio::time::sleep(Duration::from_millis(300)).await;
     held.commit().await.expect("the rival commits");
-    running.await.expect("the step's task")
+    let result = running.await.expect("the step's task");
+    // The step waited on the rival's lock, then ran its body once: it did
+    // race, and lost, rather than run before or after the rival.
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "step {step}'s body runs");
+    result
 }
 
 /// A transactional step that loses its checkpoint race must roll back the

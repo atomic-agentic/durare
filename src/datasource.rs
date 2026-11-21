@@ -61,6 +61,13 @@ pub(crate) mod sealed {
         async fn begin(&self, isolation: IsolationLevel, read_only: bool)
             -> Result<Self::NativeTx>;
 
+        /// How many conflicts in a row a transaction step on this backend
+        /// retries before it fails, if there is a limit (see
+        /// [`crate::tx::SQLITE_CONFLICT_RETRIES`]).
+        fn conflict_retry_limit(&self) -> Option<u32> {
+            None
+        }
+
         /// Commit `tx`.
         async fn commit(&self, tx: Self::NativeTx) -> Result<()>;
 
@@ -485,9 +492,21 @@ impl sealed::Backend for SqliteDataSource {
     type Conn = sqlx::SqliteConnection;
     type NativeTx = sqlx::Transaction<'static, sqlx::Sqlite>;
 
-    async fn begin(&self, _isolation: IsolationLevel, _read_only: bool) -> Result<Self::NativeTx> {
-        // SQLite is always serializable; isolation/read-only are advisory.
-        Ok(self.pool.begin().await?)
+    async fn begin(&self, _isolation: IsolationLevel, read_only: bool) -> Result<Self::NativeTx> {
+        // SQLite is always serializable, so the isolation level is advisory.
+        // A transaction that may write takes the writer lock before its body
+        // runs: begun deferred, its first write would fail with
+        // SQLITE_BUSY_SNAPSHOT whenever another connection committed after
+        // the body's first read, and the body would run again.
+        Ok(if read_only {
+            self.pool.begin().await?
+        } else {
+            self.pool.begin_with("BEGIN IMMEDIATE").await?
+        })
+    }
+
+    fn conflict_retry_limit(&self) -> Option<u32> {
+        Some(crate::tx::SQLITE_CONFLICT_RETRIES)
     }
 
     async fn commit(&self, tx: Self::NativeTx) -> Result<()> {

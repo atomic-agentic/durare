@@ -1779,6 +1779,7 @@ impl DurableContext {
             // transient DB error rolls back and retries on a fresh transaction
             // — unbounded (until it clears or the workflow is cancelled).
             let mut conflict_attempt: u32 = 0;
+            let mut lock_conflicts: u32 = 0;
             let outcome = loop {
                 match self.datasource_attempt(ds, opts, f, seq, &ser).await {
                     Ok(DsAttempt::Committed(value)) => break Ok(value),
@@ -1809,6 +1810,26 @@ impl DurableContext {
                             .await;
                     }
                     Err(e) if e.should_retry_live_transaction() => {
+                        // A lock conflict has already waited out the busy
+                        // timeout; where the backend caps them, that many in a
+                        // row is a lock that does not clear. A transient error
+                        // is retried until it clears.
+                        if e.is_tx_conflict() {
+                            lock_conflicts = lock_conflicts.saturating_add(1);
+                            if ds
+                                .conflict_retry_limit()
+                                .is_some_and(|limit| lock_conflicts >= limit)
+                            {
+                                break Err(crate::tx::conflicted_too_often(&opts.name, &e));
+                            }
+                        }
+                        crate::tx::warn_retry(
+                            &self.workflow_id,
+                            seq,
+                            &opts.name,
+                            conflict_attempt,
+                            &e,
+                        );
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
@@ -1978,6 +1999,7 @@ impl DurableContext {
         let mut user_attempt: u32 = 0;
         let body_err = loop {
             let mut conflict_attempt: u32 = 0;
+            let mut lock_conflicts: u32 = 0;
             let outcome = loop {
                 match self
                     .system_datasource_attempt(ds, opts, f, seq, ser, started)
@@ -2011,6 +2033,26 @@ impl DurableContext {
                         return self.recorded_value(StepOutcome::Output(value));
                     }
                     Err(e) if e.should_retry_live_transaction() => {
+                        // A lock conflict has already waited out the busy
+                        // timeout; where the backend caps them, that many in a
+                        // row is a lock that does not clear. A transient error
+                        // is retried until it clears.
+                        if e.is_tx_conflict() {
+                            lock_conflicts = lock_conflicts.saturating_add(1);
+                            if ds
+                                .conflict_retry_limit()
+                                .is_some_and(|limit| lock_conflicts >= limit)
+                            {
+                                break Err(crate::tx::conflicted_too_often(&opts.name, &e));
+                            }
+                        }
+                        crate::tx::warn_retry(
+                            &self.workflow_id,
+                            seq,
+                            &opts.name,
+                            conflict_attempt,
+                            &e,
+                        );
                         self.datasource_conflict_wait(conflict_attempt).await?;
                         conflict_attempt = conflict_attempt.saturating_add(1);
                     }
