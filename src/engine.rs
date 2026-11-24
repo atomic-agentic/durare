@@ -4777,7 +4777,7 @@ mod shutdown_tests {
             .await?;
         engine.launch().await?;
         tokio::time::timeout(Duration::from_secs(2), async {
-            while engine.schedule_tasks.len() == 0 {
+            while engine.schedule_tasks.is_empty() {
                 tokio::task::yield_now().await;
             }
         })
@@ -4788,7 +4788,7 @@ mod shutdown_tests {
         assert_eq!(engine.schedule_tasks.len(), 0);
         engine.launch().await?;
         tokio::time::timeout(Duration::from_secs(2), async {
-            while engine.schedule_tasks.len() == 0 {
+            while engine.schedule_tasks.is_empty() {
                 tokio::task::yield_now().await;
             }
         })
