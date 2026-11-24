@@ -36,6 +36,10 @@ use tracing::Instrument;
 /// schedule takes effect promptly.
 const SCHEDULE_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Time allowed to observe aborted task cleanup after the graceful deadline.
+/// A failed cleanup must be reported rather than represented as a safe handoff.
+const SHUTDOWN_ABORT_WAIT: Duration = Duration::from_secs(1);
+
 /// Name of the always-on internal queue every engine dispatches. Out-of-process
 /// callers (a [`Client`](crate::Client)) and the engine itself route re-executed
 /// work with no user queue (resume / fork of a direct run) here, so any live
@@ -809,8 +813,13 @@ pub struct DurableEngine {
     /// so it is counted from the instant it is created — no separate guard to
     /// keep in sync.
     tasks: TaskTracker,
+    /// Tracks per-schedule firing loops separately from workflow metrics.
+    schedule_tasks: TaskTracker,
     /// Per-queue dispatcher tasks spawned by [`launch`](Self::launch).
     dispatchers: std::sync::Mutex<Vec<JoinHandle<()>>>,
+    /// Serializes launch and shutdown across their asynchronous handoff.
+    lifecycle: tokio::sync::Mutex<()>,
+    shutdown_incomplete: AtomicBool,
     /// Shared execution core, built once from the registrations on first run and
     /// reused by every run path (and by workflows that start child workflows).
     runtime: std::sync::OnceLock<Arc<Runtime>>,
@@ -1024,7 +1033,10 @@ impl DurableEngineBuilder {
             deactivated: Arc::new(AtomicBool::new(false)),
             automatic_recovery_stop: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            schedule_tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
+            lifecycle: tokio::sync::Mutex::new(()),
+            shutdown_incomplete: AtomicBool::new(false),
             runtime: std::sync::OnceLock::new(),
         })
     }
@@ -1109,7 +1121,10 @@ impl DurableEngine {
             deactivated: Arc::new(AtomicBool::new(false)),
             automatic_recovery_stop: CancellationToken::new(),
             tasks: TaskTracker::new(),
+            schedule_tasks: TaskTracker::new(),
             dispatchers: std::sync::Mutex::new(Vec::new()),
+            lifecycle: tokio::sync::Mutex::new(()),
+            shutdown_incomplete: AtomicBool::new(false),
             runtime: std::sync::OnceLock::new(),
         })
     }
@@ -1209,6 +1224,7 @@ impl DurableEngine {
                     executor_id: self.executor_id.clone(),
                     app_version: self.app_version.clone(),
                     tasks: self.tasks.clone(),
+                    schedule_tasks: self.schedule_tasks.clone(),
                     counters: EngineCounters::default(),
                     shutdown_token: self.shutdown_token.clone(),
                     abort_workflows: self.abort_workflows.clone(),
@@ -1596,11 +1612,12 @@ impl DurableEngine {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<Vec<String>> {
+        let admission = self.runtime().workflow_abort_token();
         let schedule = self
             .get_schedule(schedule_name)
             .await?
             .ok_or_else(|| Error::app(format!("schedule not found: {schedule_name}")))?;
-        backfill_ticks(&self.runtime(), &schedule, start, end).await
+        backfill_ticks(&self.runtime(), &schedule, start, end, &admission).await
     }
 
     /// Fire a schedule's workflow immediately, once, returning a handle to the
@@ -1611,6 +1628,7 @@ impl DurableEngine {
     where
         O: DeserializeOwned,
     {
+        let admission = self.runtime().workflow_abort_token();
         let schedule = self
             .get_schedule(schedule_name)
             .await?
@@ -1625,7 +1643,7 @@ impl DurableEngine {
         let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let wf_id = format!("sched-{schedule_name}-trigger-{stamp}");
         let (canonical, queued, created) = rt.persist_scheduled_run(&schedule, &wf_id, now).await?;
-        Ok(self.handle_for(&rt, canonical, queued, created, handler))
+        Ok(self.handle_for(&rt, canonical, queued, created, handler, admission))
     }
 
     /// Every registered application version, newest first. Versions are recorded
@@ -1665,6 +1683,10 @@ impl DurableEngine {
     /// launch in that snapshot. For other stopped owners, use
     /// [`recover_pending_for`](Self::recover_pending_for).
     pub async fn launch(&self) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.shutdown_incomplete.load(Ordering::Acquire) {
+            return Err(Error::Timeout);
+        }
         // A deactivated process must not start claiming work again.
         if self.is_deactivated() {
             return Ok(());
@@ -1703,6 +1725,7 @@ impl DurableEngine {
             token.clone()
         };
         self.tasks.reopen();
+        self.schedule_tasks.reopen();
         {
             let mut abort = self.abort_workflows.lock().expect("abort token poisoned");
             if abort.is_cancelled() {
@@ -1821,7 +1844,7 @@ impl DurableEngine {
                 tokio::select! {
                     biased;
                     _ = abort.cancelled() => {},
-                    result = dispatch_pending_workflows(&rt, to_recover, &cancel) => match result {
+                    result = dispatch_pending_workflows(&rt, to_recover, &cancel, &abort) => match result {
                         Ok(ids) => tracing::info!(count = ids.len(), "recovered pending workflows on launch"),
                         Err(e) => tracing::warn!(error = %e, "recover-on-launch failed"),
                     },
@@ -2075,8 +2098,14 @@ impl DurableEngine {
     ///
     /// If the timeout expires, tracked workflow futures are cancelled and
     /// awaited before this returns. Interrupted runs retain pending rows and
-    /// completed step checkpoints for recovery.
+    /// completed step checkpoints for recovery. If aborted tasks cannot be
+    /// observed stopped within the cleanup deadline, returns [`Error::Timeout`];
+    /// recovery must wait until the old execution has actually stopped.
     pub async fn shutdown(&self, timeout: Duration) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.shutdown_incomplete.load(Ordering::Acquire) {
+            return Err(Error::Timeout);
+        }
         self.shutdown_token
             .lock()
             .expect("shutdown token poisoned")
@@ -2093,21 +2122,27 @@ impl DurableEngine {
         for d in &dispatchers {
             d.abort();
         }
-        for d in dispatchers {
-            let _ = d.await;
-        }
+        let dispatchers_stopped = tokio::time::timeout(SHUTDOWN_ABORT_WAIT, async {
+            for d in dispatchers {
+                let _ = d.await;
+            }
+        })
+        .await
+        .is_ok();
         // Drain in-flight runs until the deadline, then cancel every tracked
         // future and wait for its destructor before allowing recovery.
         self.tasks.close();
-        if tokio::time::timeout(timeout, self.tasks.wait())
-            .await
-            .is_err()
+        self.schedule_tasks.close();
+        if tokio::time::timeout(timeout, async {
+            tokio::join!(self.tasks.wait(), self.schedule_tasks.wait());
+        })
+        .await
+        .is_err()
         {
             self.abort_workflows
                 .lock()
                 .expect("abort token poisoned")
                 .cancel();
-            self.tasks.wait().await;
         }
         // Fence any caller that raced shutdown and captured this generation's
         // token after the first wait observed an empty tracker.
@@ -2115,8 +2150,17 @@ impl DurableEngine {
             .lock()
             .expect("abort token poisoned")
             .cancel();
-        self.tasks.wait().await;
-        Ok(())
+        let workflows_stopped = tokio::time::timeout(SHUTDOWN_ABORT_WAIT, async {
+            tokio::join!(self.tasks.wait(), self.schedule_tasks.wait());
+        })
+        .await
+        .is_ok();
+        if dispatchers_stopped && workflows_stopped {
+            Ok(())
+        } else {
+            self.shutdown_incomplete.store(true, Ordering::Release);
+            Err(Error::Timeout)
+        }
     }
 
     /// Start (or attach to) a workflow and return a [`WorkflowHandle`] **without
@@ -2172,6 +2216,7 @@ impl DurableEngine {
         I: Serialize,
     {
         let rt = self.runtime();
+        let admission = rt.workflow_abort_token();
         let id = opts.id_or_fresh();
         let input_json = serde_json::to_value(input)?;
         opts.validate_deduplication(opts.queue.as_deref())?;
@@ -2186,7 +2231,7 @@ impl DurableEngine {
         let (canonical, queued, created) = rt
             .insert_run_with_dedup(&id, name, input_json, &opts, None, &auth)
             .await?;
-        Ok(self.handle_for(&rt, canonical, queued, created, handler))
+        Ok(self.handle_for(&rt, canonical, queued, created, handler, admission))
     }
 
     /// The handle for a run this call just persisted: over the task when the
@@ -2207,12 +2252,13 @@ impl DurableEngine {
         queued: bool,
         created: bool,
         handler: WorkflowFn,
+        admission: CancellationToken,
     ) -> WorkflowHandle<O> {
         let id = canonical.id.clone();
         if queued || !created || is_terminal(&canonical.status) {
             return WorkflowHandle::polling(id, self.provider.clone());
         }
-        let join = rt.spawn_owned(canonical, handler);
+        let join = rt.spawn_owned(canonical, handler, admission);
         WorkflowHandle::local(id, self.provider.clone(), join)
     }
 
@@ -2927,7 +2973,9 @@ impl DurableEngine {
             .lock()
             .expect("shutdown token poisoned")
             .clone();
-        recover_pending_workflows(&self.runtime(), executor_ids, &cancel).await
+        let rt = self.runtime();
+        let abort = rt.workflow_abort_token();
+        recover_pending_workflows(&rt, executor_ids, &cancel, &abort).await
     }
 }
 
@@ -2944,9 +2992,10 @@ pub(crate) async fn recover_pending_workflows(
     rt: &Arc<Runtime>,
     executor_ids: &[String],
     cancel: &CancellationToken,
+    abort: &CancellationToken,
 ) -> Result<Vec<String>> {
     let pending = list_pending_workflows(rt, executor_ids).await?;
-    dispatch_pending_workflows(rt, pending, cancel).await
+    dispatch_pending_workflows(rt, pending, cancel, abort).await
 }
 
 /// The `PENDING` workflows of this app version owned by the given executors
@@ -2991,6 +3040,7 @@ pub(crate) async fn dispatch_pending_workflows(
     rt: &Arc<Runtime>,
     pending: Vec<WorkflowStatus>,
     cancel: &CancellationToken,
+    abort: &CancellationToken,
 ) -> Result<Vec<String>> {
     let total = pending.len();
     let mut recovered = Vec::new();
@@ -3075,12 +3125,17 @@ pub(crate) async fn dispatch_pending_workflows(
                 recovered.push(record.id);
             }
             RecoveryClaim::Claimed { attempts } => {
+                if cancel.is_cancelled() {
+                    // The claim persisted, but shutdown won before dispatch.
+                    // Leave it pending for a subsequent recovery generation.
+                    continue;
+                }
                 let handler =
                     handler.expect("only non-queued rows are claimed for direct dispatch");
                 let mut claimed = record.clone();
                 claimed.executor_id = rt.executor_id.clone();
                 claimed.recovery_attempts = attempts;
-                rt.spawn_detached(claimed, handler);
+                rt.spawn_detached_with_abort(claimed, handler, abort.clone());
                 rt.counters
                     .workflows_recovered
                     .fetch_add(1, Ordering::Relaxed);
@@ -3222,6 +3277,7 @@ pub(crate) struct Runtime {
     executor_id: String,
     app_version: String,
     tasks: TaskTracker,
+    schedule_tasks: TaskTracker,
     abort_workflows: Arc<std::sync::Mutex<CancellationToken>>,
     pub(crate) counters: EngineCounters,
     shutdown_token: Arc<std::sync::Mutex<CancellationToken>>,
@@ -3416,9 +3472,9 @@ impl Runtime {
         self: &Arc<Self>,
         record: WorkflowStatus,
         handler: WorkflowFn,
+        abort: CancellationToken,
     ) -> JoinHandle<Result<Value>> {
         let span = self.workflow_span(&record);
-        let abort = self.workflow_abort_token();
         let run = run_to_completion(self.clone(), handler, record, span);
         self.tasks.spawn(async move {
             tokio::select! {
@@ -3432,7 +3488,16 @@ impl Runtime {
     /// Detached runs use exactly the same execution and recovery owner as local
     /// handles. Dropping the handle does not remove them from the task tracker.
     fn spawn_detached(self: &Arc<Self>, record: WorkflowStatus, handler: WorkflowFn) {
-        drop(self.spawn_owned(record, handler));
+        self.spawn_detached_with_abort(record, handler, self.workflow_abort_token());
+    }
+
+    fn spawn_detached_with_abort(
+        self: &Arc<Self>,
+        record: WorkflowStatus,
+        handler: WorkflowFn,
+        abort: CancellationToken,
+    ) {
+        drop(self.spawn_owned(record, handler, abort));
     }
 
     /// Persist one scheduled tick at `instant` under the deterministic
@@ -4310,11 +4375,18 @@ async fn backfill_ticks(
     schedule: &WorkflowSchedule,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
+    admission: &CancellationToken,
 ) -> Result<Vec<String>> {
     let cron = parse_cron(&schedule.schedule)?;
     let mut ids = Vec::new();
     for instant in cron_ticks_between(&cron, schedule.cron_timezone.as_deref(), start, end) {
+        if admission.is_cancelled() {
+            return Err(Error::Timeout);
+        }
         let (canonical, queued, created, id) = rt.persist_scheduled_tick(schedule, instant).await?;
+        if admission.is_cancelled() {
+            return Err(Error::Timeout);
+        }
         rt.launch_scheduled_tick(schedule, canonical, queued, created);
         ids.push(id);
     }
@@ -4434,7 +4506,9 @@ async fn schedule_reconciler(
                     let start = last + chrono::Duration::seconds(1);
                     let end = Utc::now();
                     if start < end {
-                        if let Err(e) = backfill_ticks(&rt, &schedule, start, end).await {
+                        let admission = rt.workflow_abort_token();
+                        if let Err(e) = backfill_ticks(&rt, &schedule, start, end, &admission).await
+                        {
                             tracing::error!(
                                 schedule = %schedule.schedule_name, error = %e,
                                 "automatic backfill failed"
@@ -4451,12 +4525,16 @@ async fn schedule_reconciler(
                     stop: stop.clone(),
                 },
             );
-            tokio::spawn(schedule_fire_loop(
-                schedule,
-                rt.clone(),
-                stop,
-                cancel.clone(),
-            ));
+            let fire_rt = rt.clone();
+            let fire_cancel = cancel.clone();
+            let abort = rt.workflow_abort_token();
+            rt.schedule_tasks.spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = abort.cancelled() => {},
+                    _ = schedule_fire_loop(schedule, fire_rt, stop, fire_cancel) => {},
+                }
+            });
         }
 
         sleep_until_or_shutdown(SCHEDULE_RECONCILE_INTERVAL, &cancel).await;
@@ -4626,5 +4704,98 @@ mod config_tests {
         let cfg = EngineConfig::default().app_version("9.9.9");
         assert_eq!(cfg.resolve_app_version(), "9.9.9");
         assert_eq!(cfg.resolve_executor_id(), "local");
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use crate::{InMemoryProvider, ScheduleOptions, ScheduledInput};
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn pre_shutdown_admission_cannot_use_relaunch_generation() -> Result<()> {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+        let body_runs = runs.clone();
+        engine.register("job", move |_ctx: DurableContext, _: ()| {
+            let runs = body_runs.clone();
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, Error>(())
+            }
+        });
+        engine.launch().await?;
+        let rt = engine.runtime();
+        let old_admission = rt.workflow_abort_token();
+        let opts = WorkflowOptions::with_id("old-admission");
+        let (row, queued, created) = rt
+            .insert_run(
+                "old-admission",
+                "job",
+                Value::Null,
+                &opts,
+                None,
+                &AuthContext::from_options(&opts),
+            )
+            .await?;
+        assert!(created && !queued);
+
+        engine.shutdown(Duration::ZERO).await?;
+        engine.launch().await?;
+        let handler = rt.workflows.get("job").unwrap().clone();
+        let old_handle: WorkflowHandle<()> =
+            engine.handle_for(&rt, row, queued, created, handler, old_admission);
+        assert!(old_handle.result().await.is_err());
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            engine
+                .retrieve_workflow::<()>("old-admission")
+                .await?
+                .get_status()
+                .await?
+                .status,
+            STATUS_PENDING
+        );
+        let fresh = engine
+            .start::<_, ()>("job", (), WorkflowOptions::with_id("fresh-admission"))
+            .await?;
+        fresh.result().await?;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        engine.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduled_fire_loop_is_drained_before_relaunch() -> Result<()> {
+        let mut engine = DurableEngine::new(Arc::new(InMemoryProvider::new())).await?;
+        engine.register("tick", |_ctx: DurableContext, _: ScheduledInput| async {
+            Ok::<_, Error>(())
+        });
+        engine
+            .create_schedule("later", "tick", "0 0 0 1 1 *", ScheduleOptions::new())
+            .await?;
+        engine.launch().await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.schedule_tasks.len() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("schedule fire loop was never installed");
+        assert_eq!(engine.schedule_tasks.len(), 1);
+        engine.shutdown(Duration::ZERO).await?;
+        assert_eq!(engine.schedule_tasks.len(), 0);
+        engine.launch().await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while engine.schedule_tasks.len() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("schedule fire loop was not reinstalled");
+        engine.shutdown(Duration::ZERO).await?;
+        assert_eq!(engine.schedule_tasks.len(), 0);
+        Ok(())
     }
 }
