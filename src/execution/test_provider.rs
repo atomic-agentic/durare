@@ -17,7 +17,9 @@ pub enum Fault {
     WriteAlways,
     WriteThenClaimFailure,
     ClaimFailure,
-    ClaimAlways,
+    ClaimPermanent,
+    ConsumeBefore,
+    ConsumeAfter,
     ClaimAfter,
     WriteAfter,
     TerminalBefore,
@@ -82,8 +84,7 @@ impl FaultProvider {
     fn take(&self, fault: Fault) -> bool {
         let mut plan = self.faults.lock().unwrap();
         match (plan.front(), fault) {
-            (Some(Fault::WriteAlways), Fault::WriteBefore)
-            | (Some(Fault::ClaimAlways), Fault::ClaimFailure) => true,
+            (Some(Fault::WriteAlways), Fault::WriteBefore) => true,
             (Some(next), _) if *next == fault => {
                 plan.pop_front();
                 true
@@ -326,9 +327,17 @@ impl StateProvider for FaultProvider {
         seq: i32,
         step_name: &str,
     ) -> Result<Option<Value>> {
-        self.inner
+        if self.take(Fault::ConsumeBefore) {
+            return Self::failure();
+        }
+        let value = self
+            .inner
             .consume_notification(workflow_id, topic, seq, step_name)
-            .await
+            .await?;
+        if value.is_some() && self.take(Fault::ConsumeAfter) {
+            return Self::failure();
+        }
+        Ok(value)
     }
     async fn upsert_event(&self, workflow_id: &str, key: &str, value: Value) -> Result<()> {
         self.inner.upsert_event(workflow_id, key, value).await
@@ -415,7 +424,9 @@ impl StateProvider for FaultProvider {
         if self.block_claim.load(Ordering::SeqCst) {
             self.claim_permit.acquire().await.unwrap().forget();
         }
-        let result = if self.take(Fault::ClaimFailure) {
+        let result = if self.take(Fault::ClaimPermanent) {
+            Err(Error::app("invalid recovery request"))
+        } else if self.take(Fault::ClaimFailure) {
             Self::failure()
         } else {
             self.inner.claim_for_recovery(req).await

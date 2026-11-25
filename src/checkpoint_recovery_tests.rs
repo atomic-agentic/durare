@@ -2427,7 +2427,9 @@ async fn observation_failure_does_not_claim_the_target_execution_stopped() -> Re
 async fn permanent_recovery_claim_failure_stops_retrying_without_running_the_body() -> Result<()> {
     let inner = Arc::new(InMemoryProvider::new());
     let provider = Arc::new(FaultProvider::new(inner.clone(), Fault::WriteBefore));
-    provider.arm([Fault::WriteBefore, Fault::ClaimAlways]);
+    provider.arm(
+        std::iter::once(Fault::WriteBefore).chain(std::iter::repeat_n(Fault::ClaimPermanent, 9)),
+    );
     let mut engine = DurableEngine::new(provider.clone()).await?;
     let runs = Arc::new(AtomicUsize::new(0));
     let count = runs.clone();
@@ -2464,6 +2466,99 @@ async fn permanent_recovery_claim_failure_stops_retrying_without_running_the_bod
     assert_eq!(status.recovery_attempts, 0);
     engine.shutdown(Duration::from_secs(1)).await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn recovery_claim_outlasts_eight_transient_failures() -> Result<()> {
+    let db = Arc::new(InMemoryProvider::new());
+    let provider = Arc::new(FaultProvider::new(db.clone(), Fault::TerminalBefore));
+    provider.arm(
+        std::iter::once(Fault::TerminalBefore).chain(std::iter::repeat_n(Fault::ClaimFailure, 9)),
+    );
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    let bodies = Arc::new(AtomicUsize::new(0));
+    let count = bodies.clone();
+    engine.register("recover", move |ctx: DurableContext, _: ()| {
+        let count = count.clone();
+        async move {
+            ctx.step("finished", || async {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(42)
+            })
+            .await
+        }
+    });
+    let _ = engine
+        .start::<_, i32>("recover", (), WorkflowOptions::with_id("outage"))
+        .await?
+        .result()
+        .await;
+    let answer = tokio::time::timeout(
+        Duration::from_secs(60),
+        engine.retrieve_workflow::<i32>("outage").await?.result(),
+    )
+    .await
+    .expect("recovery after storage returned")?;
+    assert_eq!(answer, 42);
+    assert_eq!(provider.claim_calls.load(Ordering::SeqCst), 10);
+    assert_eq!(bodies.load(Ordering::SeqCst), 1);
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+async fn recv_survives_outage(db: Arc<dyn StateProvider>) -> Result<()> {
+    let provider = Arc::new(FaultProvider::new(db.clone(), Fault::ConsumeAfter));
+    provider.arm([
+        Fault::ConsumeBefore,
+        Fault::ConsumeBefore,
+        Fault::ConsumeAfter,
+    ]);
+    let mut builder = DurableEngine::builder(provider.clone());
+    builder.max_recovery_attempts(0);
+    let mut engine = builder.build().await?;
+    engine.register("waiting", |ctx: DurableContext, _: ()| async move {
+        ctx.send(ctx.workflow_id(), "yes", "decision").await?;
+        ctx.recv::<String>("decision", Duration::from_secs(2)).await
+    });
+    let result = engine
+        .start::<_, Option<String>>("waiting", (), WorkflowOptions::with_id("waiting"))
+        .await?
+        .result()
+        .await?;
+    assert_eq!(result.as_deref(), Some("yes"));
+    assert_eq!(provider.claim_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        db.get_workflow_status("waiting")
+            .await?
+            .unwrap()
+            .recovery_attempts,
+        0
+    );
+    engine.shutdown(Duration::from_secs(2)).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_receiver_retries_its_own_position_after_storage_failure() -> Result<()> {
+    recv_survives_outage(Arc::new(InMemoryProvider::new())).await
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_receiver_retries_its_own_position_after_storage_failure() -> Result<()> {
+    recv_survives_outage(Arc::new(SqliteProvider::connect("sqlite::memory:").await?)).await
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_receiver_retries_its_own_position_after_storage_failure() -> Result<()> {
+    let Ok(base) = std::env::var("DATABASE_URL") else {
+        return Ok(());
+    };
+    let (admin, url, db) = common::hermetic_pg_db(&base, "recv_outage").await;
+    let result = recv_survives_outage(Arc::new(PostgresProvider::connect(&url).await?)).await;
+    common::drop_hermetic_pg_db(&admin, &db).await;
+    result
 }
 
 #[tokio::test]

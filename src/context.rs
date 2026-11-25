@@ -2924,6 +2924,7 @@ impl DurableContext {
                 return Ok(stored);
             }
 
+            let mut retry_delay = NOTIFICATION_POLL_INTERVAL;
             let mut deadline: Option<chrono::DateTime<chrono::Utc>> = None;
             loop {
                 // Watch before checking, so a message written between the check
@@ -2932,15 +2933,25 @@ impl DurableContext {
                     workflow_id: &self.workflow_id,
                     topic: &topic,
                 });
-                if let Some(msg) = self
+                match self
                     .provider
                     .consume_notification(&self.workflow_id, &topic, seq, "DBOS.recv")
                     .await
-                    .map_err(|error| self.execution.record(error))?
                 {
-                    // The position's settled outcome: taken now, or recorded
-                    // by a rival execution first (`Null` is a timeout).
-                    return self.recorded_value(StepOutcome::Output(msg));
+                    Ok(Some(msg)) => {
+                        // Taken now or recorded by an earlier attempt at this position.
+                        return self.recorded_value(StepOutcome::Output(msg));
+                    }
+                    Ok(None) => retry_delay = NOTIFICATION_POLL_INTERVAL,
+                    Err(error) if error.should_retry_live_transaction() => {
+                        // Consumption and its checkpoint are atomic. A repeat with the
+                        // same position also resolves a lost reply after a commit.
+                        self.execution.check()?;
+                        tokio::time::sleep(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                        continue;
+                    }
+                    Err(error) => return Err(self.execution.record(error)),
                 }
 
                 // Mailbox empty: fix the durable deadline (first miss only), then
