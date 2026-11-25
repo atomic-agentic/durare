@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tokio::sync::{Notify, Semaphore};
@@ -48,6 +48,7 @@ pub struct FaultProvider {
     pub claim_finished: Notify,
     pub claim_permit: Semaphore,
     pub claim_calls: AtomicUsize,
+    pub last_consume_failure_ms: AtomicI64,
     pub block_claim_reply: AtomicBool,
     pub claim_committed: Notify,
     pub claim_reply_permit: Semaphore,
@@ -72,6 +73,7 @@ impl FaultProvider {
             claim_finished: Notify::new(),
             claim_permit: Semaphore::new(0),
             claim_calls: AtomicUsize::new(0),
+            last_consume_failure_ms: AtomicI64::new(0),
             block_claim_reply: AtomicBool::new(false),
             claim_committed: Notify::new(),
             claim_reply_permit: Semaphore::new(0),
@@ -328,6 +330,8 @@ impl StateProvider for FaultProvider {
         step_name: &str,
     ) -> Result<Option<Value>> {
         if self.take(Fault::ConsumeBefore) {
+            self.last_consume_failure_ms
+                .store(chrono::Utc::now().timestamp_millis(), Ordering::SeqCst);
             return Self::failure();
         }
         let value = self

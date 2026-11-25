@@ -2640,7 +2640,7 @@ impl DurableContext {
         let position = claim!(self, "sleep");
         let seq = position.seq();
         PendingStep::new(position, async move {
-            let wake_at = self.durable_wake_at(seq, dur).await?;
+            let wake_at = self.durable_wake_at(seq, dur, chrono::Utc::now).await?;
             let now = chrono::Utc::now();
             // A verification run reads the recorded wake instant and moves on.
             // Waiting it out would stall the check for however long the timer
@@ -2726,7 +2726,7 @@ impl DurableContext {
     }
 
     /// The instant a durable timer claimed at `seq` fires: the recorded one, or
-    /// `dur` from now, recorded as a `DBOS.sleep` step whose start is now and
+    /// `dur` from the supplied start, recorded as a `DBOS.sleep` step
     /// whose completion is the wake instant, so the row spans the wait and a
     /// timer never extends across a crash. Behind [`sleep`](Self::sleep) and
     /// the `recv`/`get_event` timeouts.
@@ -2734,11 +2734,12 @@ impl DurableContext {
         &self,
         seq: i32,
         dur: Duration,
+        started_at: impl FnOnce() -> chrono::DateTime<chrono::Utc>,
     ) -> Result<chrono::DateTime<chrono::Utc>> {
         if let Some(recorded) = self.serve_recorded(seq, "DBOS.sleep").await? {
             return Ok(recorded);
         }
-        let started = chrono::Utc::now();
+        let started = started_at();
         let wake_at =
             started + chrono::Duration::from_std(dur).unwrap_or_else(|_| chrono::Duration::zero());
         self.checkpoint_timed(
@@ -2880,8 +2881,9 @@ impl DurableContext {
     /// claim and the step checkpoint commit
     /// atomically, and a replay returns the recorded message without consuming
     /// another. Returns `None` on timeout (also recorded, so a replay does not
-    /// wait again). The timeout deadline itself is durable: a crash mid-wait
-    /// resumes with the *remaining* time, not a fresh timeout. An empty
+    /// wait again). The timeout starts when the receive is first polled, including
+    /// time spent retrying mailbox reads. The first empty read records that
+    /// deadline so recovery resumes with the remaining time. An empty
     /// `topic` is the topic-less mailbox, shared with the other SDKs (see
     /// [`send`](Self::send)).
     ///
@@ -2916,6 +2918,7 @@ impl DurableContext {
         let seq = position.seq();
         let deadline_seq = self.next_seq();
         PendingStep::new(position, async move {
+            let started = chrono::Utc::now();
             // Construction reserves positions; only a polled wait accounts for
             // its deadline during verification. Do this before the replay gate,
             // which may stop at an in-flight wait with only a deadline recorded.
@@ -2954,11 +2957,14 @@ impl DurableContext {
                     Err(error) => return Err(self.execution.record(error)),
                 }
 
-                // Mailbox empty: fix the durable deadline (first miss only), then
-                // poll until a message arrives or the deadline passes.
+                // Only an empty mailbox needs a deadline record. Include time spent
+                // retrying reads before the first successful mailbox check.
                 let deadline = match deadline {
                     Some(d) => d,
-                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+                    None => *deadline.insert(
+                        self.durable_wake_at(deadline_seq, timeout, || started)
+                            .await?,
+                    ),
                 };
                 let now = chrono::Utc::now();
                 if now >= deadline {
@@ -3098,7 +3104,10 @@ impl DurableContext {
 
                 let deadline = match deadline {
                     Some(d) => d,
-                    None => *deadline.insert(self.durable_wake_at(deadline_seq, timeout).await?),
+                    None => *deadline.insert(
+                        self.durable_wake_at(deadline_seq, timeout, chrono::Utc::now)
+                            .await?,
+                    ),
                 };
                 let now = chrono::Utc::now();
                 if now >= deadline {

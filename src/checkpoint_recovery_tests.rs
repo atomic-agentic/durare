@@ -2535,6 +2535,64 @@ async fn recv_survives_outage(db: Arc<dyn StateProvider>) -> Result<()> {
         0
     );
     engine.shutdown(Duration::from_secs(2)).await?;
+    recv_deadline_survives_outage(db).await
+}
+
+// An empty first read after an outage records the original deadline. Lose
+// the reply to that checkpoint, then replay with a deliberately long timeout
+// to prove the recorded deadline wins.
+async fn recv_deadline_survives_outage(db: Arc<dyn StateProvider>) -> Result<()> {
+    let id = "empty-outage";
+    let provider = Arc::new(FaultProvider::new(db.clone(), Fault::ConsumeBefore));
+    provider.arm([
+        Fault::ConsumeBefore,
+        Fault::ConsumeBefore,
+        Fault::WriteAfter,
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    let mut engine = DurableEngine::new(provider.clone()).await?;
+    engine.register("empty", move |ctx: DurableContext, _: ()| {
+        let timeout = if count.fetch_add(1, Ordering::SeqCst) == 0 {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_secs(3600)
+        };
+        async move { ctx.recv::<String>("empty", timeout).await }
+    });
+    let first = engine
+        .start::<_, Option<String>>("empty", (), WorkflowOptions::with_id(id))
+        .await?
+        .result()
+        .await;
+    assert!(matches!(first, Err(Error::RecoveryRequired(_))));
+    let recovered = tokio::time::timeout(
+        Duration::from_secs(10),
+        engine
+            .retrieve_workflow::<Option<String>>(id)
+            .await?
+            .result(),
+    )
+    .await
+    .expect("replay uses the persisted deadline")?;
+    assert_eq!(recovered, None);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let deadline = db
+        .get_workflow_steps(id)
+        .await?
+        .into_iter()
+        .find(|step| step.name == "DBOS.sleep")
+        .expect("durable deadline");
+    let expires = deadline
+        .completed_at
+        .expect("deadline completion time")
+        .timestamp_millis();
+    let fault = provider.last_consume_failure_ms.load(Ordering::SeqCst);
+    assert!(
+        expires <= fault,
+        "receive extended its deadline past the outage: {expires} > {fault}"
+    );
+    engine.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
 
