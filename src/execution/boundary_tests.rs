@@ -717,16 +717,37 @@ async fn deactivated_settlement_still_respects_shutdown_and_cancellation() -> Re
 }
 
 #[tokio::test]
-async fn shutdown_timeout_does_not_stop_a_running_body() -> Result<()> {
+async fn shutdown_timeout_stops_a_running_body_before_recovery() -> Result<()> {
+    struct CountDrop(Arc<AtomicUsize>);
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     let inner = Arc::new(InMemoryProvider::new());
     let mut engine = DurableEngine::new(inner.clone()).await?;
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Semaphore::new(0));
-    let (started, gate) = (entered.clone(), release.clone());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let (started, gate, counted, dropped) = (
+        entered.clone(),
+        release.clone(),
+        attempts.clone(),
+        drops.clone(),
+    );
     engine.register("held", move |ctx: DurableContext, _: ()| {
-        let (started, gate) = (started.clone(), gate.clone());
+        let (started, gate, counted, dropped) = (
+            started.clone(),
+            gate.clone(),
+            counted.clone(),
+            dropped.clone(),
+        );
         async move {
             ctx.step("held", || async {
+                let _drop = CountDrop(dropped);
+                counted.fetch_add(1, Ordering::SeqCst);
                 started.notify_one();
                 gate.acquire().await.unwrap().forget();
                 Ok(42)
@@ -734,19 +755,30 @@ async fn shutdown_timeout_does_not_stop_a_running_body() -> Result<()> {
             .await
         }
     });
-    let handle = engine
+    engine
         .start::<_, i32>("held", (), WorkflowOptions::with_id("held"))
         .await?;
     tokio::time::timeout(Duration::from_secs(3), entered.notified())
         .await
         .unwrap();
     engine.shutdown(Duration::ZERO).await?;
-    assert_eq!(engine.metrics().await?.workflows_in_flight, 1);
+    assert_eq!(engine.metrics().await?.workflows_in_flight, 0);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1, "old body must be dropped");
     assert_eq!(
         inner.get_workflow_status("held").await?.unwrap().status,
         STATUS_PENDING
     );
     release.add_permits(1);
+    tokio::task::yield_now().await;
+    assert_eq!(
+        inner.get_workflow_status("held").await?.unwrap().status,
+        STATUS_PENDING,
+        "a stopped body cannot consume the release and publish after shutdown"
+    );
+    engine.launch().await?;
+    engine.recover().await?;
+    let handle = engine.retrieve_workflow::<i32>("held").await?;
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(3), handle.result())
             .await
@@ -754,6 +786,8 @@ async fn shutdown_timeout_does_not_stop_a_running_body() -> Result<()> {
         42
     );
     wait_for_attempts_to_stop(&engine).await?;
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
     assert_eq!(
         inner.get_workflow_status("held").await?.unwrap().status,
         STATUS_SUCCESS

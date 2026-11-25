@@ -31,6 +31,7 @@ pub(crate) enum TransactionAttempt {
     /// errors raised by the transaction's machinery (its begin, checkpoint or
     /// commit), so that only the body's lock conflicts count toward
     /// [`SQLITE_CONFLICT_RETRIES`].
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     BodyConflicted(Error),
 }
 
