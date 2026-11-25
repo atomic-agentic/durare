@@ -3148,7 +3148,8 @@ pub(crate) async fn dispatch_pending_workflows(
 
 /// Recover one stopped execution using the ownership generation that ran it.
 /// A failed claim retries only the claim, never the body. Bound those retries
-/// separately: an unavailable database cannot persist a parking transition.
+/// separately for permanent errors. A temporarily unavailable database cannot
+/// persist a parking transition or prove it changed ownership.
 #[derive(Clone, Copy, Debug)]
 enum RecoveryDisposition {
     Retry,
@@ -3176,7 +3177,8 @@ async fn recover_interrupted_run(
     let mut delay = Duration::from_millis(100)
         .saturating_mul(1u32 << record.recovery_attempts.clamp(0, 6))
         .min(Duration::from_secs(5));
-    for failure in 0..MAX_CLAIM_FAILURES {
+    let mut permanent_failures = 0;
+    loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
@@ -3230,11 +3232,15 @@ async fn recover_interrupted_run(
                     "recovery generation changed; no dispatch; an unfinished unowned row requires explicit recovery");
                 return;
             }
-            Err(error) if failure + 1 == MAX_CLAIM_FAILURES => {
-                tracing::error!(workflow_id = %record.id, %error,
-                    "recovery claim retries exhausted; unfinished row requires explicit recovery after storage repair");
-            }
             Err(error) => {
+                if !error.should_retry_live_transaction() {
+                    permanent_failures += 1;
+                    if permanent_failures == MAX_CLAIM_FAILURES {
+                        tracing::error!(workflow_id = %record.id, %error,
+                            "recovery claim retries exhausted; unfinished row requires explicit recovery after storage repair");
+                        return;
+                    }
+                }
                 tracing::warn!(workflow_id = %record.id, %error, "recovery claim failed; retrying the same ownership generation");
                 delay = (delay * 2).min(Duration::from_secs(5));
             }

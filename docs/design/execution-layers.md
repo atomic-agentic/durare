@@ -38,7 +38,10 @@ workflow, and neither is an outcome:
   Nothing is recorded, the row stays `PENDING`, and the body's later durable
   calls are refused by the execution latch (`Execution::interrupt`,
   `Execution::check`). Settlement re-claims the row with backoff (100 ms doubling,
-  capped at 5 s) up to the recovery-attempt cap, then parks it.
+  capped at 5 s) up to the recovery-attempt cap, then parks it. If storage
+  temporarily rejects the claim, the same ownership generation is retried
+  until storage answers or the engine stops. Failed claim calls do not spend
+  the workflow's recovery attempts.
 - `Error::ObservationFailed` — the outcome of an operation could not be
   observed. The execution stops without scheduling recovery, because a lost
   response is not proof the operation did not happen.

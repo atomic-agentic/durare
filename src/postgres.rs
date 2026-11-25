@@ -1971,7 +1971,9 @@ impl StateProvider for PostgresProvider {
                         // or transient DB error retries on a fresh tx, and an
                         // application error is left for the outer user-retry loop,
                         // which records it only once the budget is exhausted.
-                        Err(e) if e.should_retry_live_transaction() => Err(e),
+                        Err(e) if e.should_retry_live_transaction() => {
+                            Ok(TransactionAttempt::BodyConflicted(e))
+                        }
                         Err(e) => {
                             tx.rollback().await?;
                             Ok(TransactionAttempt::BodyFailed(e))
