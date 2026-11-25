@@ -90,6 +90,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Interrupted workflows retry transient storage failures while claiming the
+  same ownership generation. Waiting receives retry at the same checkpoint
+  when notification polling loses its connection. If a claim commits and its
+  reply is lost, a direct workflow can still require explicit recovery.
+
 - On SQLite, a transactional step that is not read-only begins `IMMEDIATE`,
   taking the writer lock before its body runs, as the provider's other write
   paths do. Begun deferred, it failed with `SQLITE_BUSY_SNAPSHOT` at its first
